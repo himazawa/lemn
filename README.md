@@ -1,139 +1,174 @@
 # LIMN — Local Epistemic Memory Kernel + Laya Model Router
 
+LIMN is a small local system for two related jobs:
+
+1. route chat requests to a fast or heavy model
+2. decide which turns are worth storing as long-term memory
+
+It uses:
+
+- a Go router for model selection
+- a Go daemon for logging, extraction, and memory routing
+- a Python Laya service for typed decisions
+- PostgreSQL + pgvector for the memory kernel
+- a Pi extension that logs turns and injects retrieved memories
+
 ## Components
 
 | Component | Language | Purpose |
 |---|---|---|
-| `limnd/cmd/daemon` | Go | Ingests Pi turns (durable queue), asks Laya if they are memory-worthy, then extracts and routes approved memories into the epistemic kernel |
-| `limnd/cmd/labeler` | Go | CLI to hand-label unreviewed turns for SLM fine-tuning |
-| `limnd/cmd/export` | Go | Exports human-reviewed turns to train/valid JSONL for MLX fine-tuning |
-| `limnd/cmd/limn` | Go | Admin CLI — list/confirm/reject PENDING memories |
-| `limnd/cmd/router` | Go | OpenAI-compatible proxy: classifies each request with Laya, forwards to fast or heavy Qwen backend |
-| `layarouter/server.py` | Python | Wraps the Hugging Face `convaiinnovations/laya-typed-decisions` checkpoint behind `/classify` and `/memory-worthiness` HTTP endpoints |
-| `pi-extension/` | TypeScript | Pi hooks: logs turns (write path), injects retrieved memories (read path) |
-| `schema.sql` | SQL | PostgreSQL + pgvector schema for the memory kernel |
+| `limnd/cmd/router` | Go | OpenAI-compatible proxy that routes each request to fast or heavy chat models |
+| `limnd/cmd/daemon` | Go | Durably ingests turns, decides whether they are memory-worthy, and routes approved memories into the kernel |
+| `limnd/cmd/limn` | Go | Admin CLI for reviewing pending memories |
+| `limnd/cmd/labeler` | Go | Interactive tool for reviewing unlabelled turns |
+| `limnd/cmd/export` | Go | Exports reviewed turns to JSONL for training |
+| `layarouter/server.py` | Python | Laya typed-decision service for `/classify` and `/memory-worthiness` |
+| `pi-extension/` | TypeScript | Pi hooks for memory read/write integration |
+| `schema.sql` | SQL | PostgreSQL + pgvector schema for the kernel |
 
-## Security model
+## How it works
 
-Every internal HTTP endpoint (`/log`, `/retrieve`, `/v1/chat/completions`, `/classify`)
-requires `Authorization: Bearer <LIMN_SHARED_SECRET>`, checked in constant time.
-**Each service refuses to start if `LIMN_SHARED_SECRET` is unset** — there is no
-"runs open by default" fallback. Generate one long random value and use it
-everywhere:
+1. Pi sends each completed turn to the daemon.
+2. The daemon stores the raw turn in SQLite first, so the turn is not lost if the process crashes.
+3. Laya decides whether the turn is worth storing.
+4. If yes, the daemon extracts a summary and category, embeds it, and routes it into Postgres.
+5. Pi asks the daemon for relevant memories before the next response and appends them to the prompt.
+
+## Requirements
+
+- Go 1.22+
+- Python 3.10+
+- PostgreSQL with `pgvector` if you want the memory kernel enabled
+- OpenAI-compatible model endpoints for:
+  - extraction on `8000`
+  - embeddings on `8001`
+  - fast chat on `8010`
+  - heavy chat on `8011`
+- Laya service on `8002`
+
+## Quick Start
+
+If your model servers are already running, the simplest macOS flow is:
 
 ```bash
-export LIMN_SHARED_SECRET=$(openssl rand -hex 32)
+chmod +x ./scripts/start-limn-macos.sh ./scripts/stop-limn-macos.sh
+./scripts/start-limn-macos.sh
 ```
 
-All services bind to `127.0.0.1` by default (override with `LIMN_DAEMON_BIND` /
-`LIMN_ROUTER_BIND` if you genuinely need non-loopback access — e.g. a
-container network — and put your own firewalling in front of it).
+That script starts the Laya service, router, and daemon, and expects your model endpoints to already be running.
 
-`cmd/limn` and the daemon both require `LIMN_POSTGRES_DSN` explicitly; there is
-no hardcoded fallback credential. Use a real secrets manager or a gitignored
-env file, not a value committed to source.
+## Manual Setup
 
-Since OpenAI-compatible clients send `Authorization: Bearer <api_key>` by
-convention, setting Pi's model `api_key` config to `LIMN_SHARED_SECRET`'s
-value is enough to authenticate against the router — no Pi-side code needed
-beyond that config field.
-
-## Durability model
-
-`/log` writes the raw turn payload into `memory_jobs` (SQLite) **synchronously,
-before responding** — this replaced the old fire-and-forget goroutine. A pool
-of worker goroutines (`LIMN_WORKER_COUNT`, default 2) claims jobs atomically,
-runs extraction + kernel routing, and retries failures with exponential
-backoff up to `max_attempts` (default 5) before marking a job permanently
-`FAILED` for inspection. On daemon startup, any job stuck in `PROCESSING`
-from a prior crash is reset to `RETRY` — turns can no longer be silently lost
-to a crash between acceptance and processing.
-
-## Port map
-
-| Port | Service |
-|---|---|
-| 8000 | Extraction model (Qwen 2.5 Coder, used by `daemon` for summary/category extraction after Laya approves storage) |
-| 8001 | Embedding model (bge-large-en-v1.5, used by `daemon`/`kernel` for vector similarity) |
-| 8002 | Laya classifier service (`layarouter/server.py`) |
-| 8010 | Fast Qwen backend (7B/14B) — point your model server here |
-| 8011 | Heavy Qwen backend (27B / Qwen 3.6 MoE) — point your model server here |
-| 8080 | `limnd` daemon (`/log`, `/retrieve`) |
-| 8090 | Model router (`/v1/chat/completions`) — point Pi's model config here instead of a model server directly |
-
-## Setup order
+If you want to start each piece yourself:
 
 ```bash
-# 0. Generate the shared secret once, export it in every shell/service
-#    that needs it (daemon, router, Laya service, and Pi's config)
 export LIMN_SHARED_SECRET=$(openssl rand -hex 32)
 
-# 1. Build the Go binaries
 cd limnd
 go build -o bin/daemon  ./cmd/daemon
 go build -o bin/labeler ./cmd/labeler
 go build -o bin/export  ./cmd/export
 go build -o bin/limn    ./cmd/limn
 go build -o bin/router  ./cmd/router
-
-# 2. Stand up your model backends
-#    - extraction model on :8000  (e.g. Qwen 2.5 Coder via oMLX/Ollama)
-#    - embedding model on :8001   (e.g. bge-large-en-v1.5)
-#    - fast Qwen (7B/14B) on :8010
-#    - heavy Qwen (27B / 3.6 MoE) on :8011
-
-# 3. Start the Laya classifier service (binds to all interfaces by
-#    default under uvicorn — pass --host 127.0.0.1 unless you have a
-#    specific reason not to)
-cd ../layarouter
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-USE_TF=0 uvicorn server:app --host 127.0.0.1 --port 8002
-
-# 4. Start the model router
-cd ../limnd
-./bin/router
-# override backend URLs if needed:
-# LIMN_FAST_MODEL_URL=http://localhost:8010/v1/chat/completions \
-# LIMN_HEAVY_MODEL_URL=http://localhost:8011/v1/chat/completions \
-# LIMN_LAYA_URL=http://localhost:8002/classify \
-# ./bin/router
-
-# 5. Start the LIMN daemon
-#    Phase 1-2 (bootstrap logging only, SQLite):
-./bin/daemon
-#    Phase 3-4 (full epistemic kernel, SQLite + PostgreSQL):
-export LIMN_POSTGRES_DSN="postgres://limn:CHANGE_ME@localhost:5432/limn_kernel?sslmode=disable"
-#    Optional overrides:
-# LIMN_LAYA_MEMORY_URL=http://localhost:8002/memory-worthiness \
-# ./bin/daemon
-
-# 6. Point Pi at the router instead of a model directly
-#    In Pi's model config: base_url = http://localhost:8090/v1
-#                          api_key  = value of $LIMN_SHARED_SECRET
-#    And set LIMN_SHARED_SECRET in Pi's own environment so the
-#    extension can authenticate to the daemon's /log and /retrieve.
-# 7. Hand-label and fine-tune the Level 1 extractor as needed
-./bin/labeler
-./bin/export
-pip install "mlx-lm[train]"
-mlx_lm.lora --model Qwen/Qwen2.5-1.5B-Instruct --train --data ./data --iters 250 --batch-size 4 --val-batches 10 --learning-rate 1e-5
-mlx_lm.fuse --model Qwen/Qwen2.5-1.5B-Instruct --adapter-path ./adapters --save-path ./laya-1.5b-custom
-
-# 8. Review pending memories as they accumulate
-LIMN_POSTGRES_DSN=$LIMN_POSTGRES_DSN ./bin/limn pending
-LIMN_POSTGRES_DSN=$LIMN_POSTGRES_DSN ./bin/limn confirm <id>
-LIMN_POSTGRES_DSN=$LIMN_POSTGRES_DSN ./bin/limn reject <id>
 ```
 
-## Env var reference (new in this revision)
+Start the Laya service:
+
+```bash
+cd ../layarouter
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+USE_TF=0 uvicorn server:app --host 127.0.0.1 --port 8002
+```
+
+Start the router:
+
+```bash
+cd ../limnd
+export LIMN_SHARED_SECRET=$LIMN_SHARED_SECRET
+export LIMN_LAYA_URL=http://127.0.0.1:8002/classify
+./bin/router
+```
+
+Start the daemon:
+
+```bash
+cd ../limnd
+export LIMN_SHARED_SECRET=$LIMN_SHARED_SECRET
+export LIMN_LAYA_MEMORY_URL=http://127.0.0.1:8002/memory-worthiness
+./bin/daemon
+```
+
+## Admin Commands
+
+Review pending memories:
+
+```bash
+cd limnd
+export LIMN_POSTGRES_DSN="postgres://limn:CHANGE_ME@localhost:5432/limn_kernel?sslmode=disable"
+./bin/limn pending
+```
+
+Confirm a memory:
+
+```bash
+./bin/limn confirm <id>
+```
+
+Reject a memory:
+
+```bash
+./bin/limn reject <id>
+```
+
+Review unlabelled turns:
+
+```bash
+./bin/labeler
+```
+
+Export reviewed turns for training:
+
+```bash
+./bin/export
+```
+
+## Configuration
 
 | Variable | Default | Used by |
 |---|---|---|
-| `LIMN_SHARED_SECRET` | *(required, no default)* | daemon, router, Laya service |
+| `LIMN_SHARED_SECRET` | required | daemon, router, Laya service, Pi |
 | `LIMN_DAEMON_BIND` | `127.0.0.1:8080` | daemon |
 | `LIMN_ROUTER_BIND` | `127.0.0.1:8090` | router |
+| `LIMN_LAYA_URL` | `http://localhost:8002/classify` | router |
 | `LIMN_LAYA_MEMORY_URL` | `http://localhost:8002/memory-worthiness` | daemon |
-| `LAYA_MEMORY_THRESHOLD` | `0.5` | Laya service (`/memory-worthiness`) |
-| `LIMN_WORKER_COUNT` | `2` | daemon (job queue workers) |
-| `LIMN_POSTGRES_DSN` | *(required, no default)* | daemon, `cmd/limn` |
+| `LAYA_MODEL_REPO` | `convaiinnovations/laya-typed-decisions` | Laya service |
+| `LAYA_MEMORY_THRESHOLD` | `0.5` | Laya service |
+| `LIMN_WORKER_COUNT` | `2` | daemon |
+| `LIMN_POSTGRES_DSN` | required for kernel/admin commands | daemon, `cmd/limn` |
+| `USE_TF` | `0` | Laya service |
+
+## Ports
+
+| Port | Service |
+|---|---|
+| 8000 | extraction model |
+| 8001 | embedding model |
+| 8002 | Laya classifier service |
+| 8010 | fast chat model |
+| 8011 | heavy chat model |
+| 8080 | LIMN daemon |
+| 8090 | LIMN router |
+
+## AI Full Disclosure
+
+This software is developed with strong assistance from AI coding agents and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you.
+
+The acknowledgement below is equally important: this would not exist without llama.cpp and GGML, largely written by hand.
+
+## Notes
+
+- The daemon uses SQLite for its durable queue and PostgreSQL for the kernel.
+- Pi does not have its own memory admin commands; use `limn pending`, `confirm`, and `reject`.
+- The router and daemon expect OpenAI-compatible HTTP endpoints.
