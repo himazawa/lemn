@@ -62,6 +62,15 @@ LIMN is different in a few ways:
 
 The tradeoff is that LIMN is more opinionated than a plain vector database. It is built for controlled long-horizon memory with review and replacement, not for dumping every trace into a bag of embeddings.
 
+Fine-tuning the classifier can make this even better by reducing false positives and false negatives in the memory-worthiness gate, which means fewer useless memories stored and fewer good ones sent to human review.
+
+How to fine-tune it:
+
+- use `./bin/labeler` to review turns and mark which ones were worth storing
+- run `./bin/export` to turn those reviews into training data
+- fine-tune the classifier checkpoint with your preferred training pipeline on that data
+- point `LAYA_MODEL_REPO` at the tuned checkpoint so the daemon uses the improved gate
+
 ## Requirements
 
 - Go 1.22+
