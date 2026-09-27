@@ -70,7 +70,6 @@ export LIMN_SHARED_SECRET=$(openssl rand -hex 32)
 
 # 1. Build the Go binaries
 cd limnd
-go mod tidy
 go build -o bin/daemon  ./cmd/daemon
 go build -o bin/labeler ./cmd/labeler
 go build -o bin/export  ./cmd/export
@@ -108,14 +107,12 @@ export LIMN_POSTGRES_DSN="postgres://limn:CHANGE_ME@localhost:5432/limn_kernel?s
 #    Optional overrides:
 # LIMN_LAYA_MEMORY_URL=http://localhost:8002/memory-worthiness \
 # ./bin/daemon
-./bin/daemon
 
 # 6. Point Pi at the router instead of a model directly
 #    In Pi's model config: base_url = http://localhost:8090/v1
 #                          api_key  = value of $LIMN_SHARED_SECRET
 #    And set LIMN_SHARED_SECRET in Pi's own environment so the
 #    extension can authenticate to the daemon's /log and /retrieve.
-s
 # 7. Hand-label and fine-tune the Level 1 extractor as needed
 ./bin/labeler
 ./bin/export
@@ -140,21 +137,3 @@ LIMN_POSTGRES_DSN=$LIMN_POSTGRES_DSN ./bin/limn reject <id>
 | `LAYA_MEMORY_THRESHOLD` | `0.5` | Laya service (`/memory-worthiness`) |
 | `LIMN_WORKER_COUNT` | `2` | daemon (job queue workers) |
 | `LIMN_POSTGRES_DSN` | *(required, no default)* | daemon, `cmd/limn` |
-
-## Still open (not covered by this pass)
-
-This pass covered auth + durable ingestion. Still unbuilt from the original
-design and worth prioritizing next: Level 2 (Qwen 32B) escalation for
-low-confidence/ambiguous extractions, a consumer for the `NEEDS_REVALIDATION`
-state, structured metrics/observability, and a CI test suite for
-`internal/limn`'s evidence/promotion logic.
-
-## One caveat worth keeping in view
-
-The router's `LAYA_ROUTING_THRESHOLD` (default 0.5) and the daemon's
-`LAYA_MEMORY_THRESHOLD` (default 0.5) are starting points, not validated
-cutoffs — Laya's zero-shot accuracy on a schema it wasn't fine-tuned for is
-well below its benchmarked numbers, and both `requires_reasoning` and
-`memory_worthy` are questions you're writing fresh, not ones it was trained
-on. Log the probabilities and treat the first weeks of real traffic as data
-to tune those thresholds against.
