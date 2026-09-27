@@ -31,8 +31,10 @@ It uses:
 1. Pi sends each completed turn to the daemon.
 2. The daemon stores the raw turn in SQLite first, so the turn is not lost if the process crashes.
 3. Laya decides whether the turn is worth storing.
-4. If yes, the daemon extracts a summary and category, embeds it, and routes it into Postgres.
-5. Pi asks the daemon for relevant memories before the next response and appends them to the prompt.
+4. If yes, the daemon extracts a summary and category, embeds it, and compares it with the current authoritative memories in Postgres.
+5. If the new memory is too close to an existing one, it is either marked as a superseding candidate or sent to human review instead of being blindly added.
+6. When a newer memory is confirmed, the older authoritative memory is marked `SUPERSEDED` and the new one becomes the active version.
+7. Pi asks the daemon for relevant memories before the next response and appends the retrieved authoritative memories to the prompt.
 
 ## Requirements
 
@@ -102,6 +104,10 @@ export LIMN_LAYA_MEMORY_URL=http://127.0.0.1:8002/memory-worthiness
 
 ## Admin Commands
 
+Use these commands to review memory state after the daemon has compared a new memory against existing `AUTHORITATIVE` entries.
+
+`pending` shows memories in `PENDING_CONFIRMATION`, including candidates that may supersede an older `AUTHORITATIVE` memory.
+
 Review pending memories:
 
 ```bash
@@ -110,11 +116,15 @@ export LIMN_POSTGRES_DSN="postgres://limn:CHANGE_ME@localhost:5432/limn_kernel?s
 ./bin/limn pending
 ```
 
+`confirm` promotes a `PENDING_CONFIRMATION` memory to `AUTHORITATIVE`. If it replaces an older memory, the older one is marked `SUPERSEDED`.
+
 Confirm a memory:
 
 ```bash
 ./bin/limn confirm <id>
 ```
+
+`reject` leaves the current `AUTHORITATIVE` memory in place and marks the pending one as `REJECTED`.
 
 Reject a memory:
 
