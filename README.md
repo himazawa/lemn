@@ -36,6 +36,32 @@ It uses:
 6. When a newer memory is confirmed, the older authoritative memory is marked `SUPERSEDED` and the new one becomes the active version.
 7. Pi asks the daemon for relevant memories before the next response and appends the retrieved authoritative memories to the prompt.
 
+## Why This Helps Long-Horizon Use
+
+LIMN is useful when the conversation has to stay coherent across many turns, sessions, or even days.
+
+It helps because it does not treat memory as a single flat log. It separates raw turn capture, memory-worthiness gating, extraction, retrieval, and supersession, so the system can keep useful information while still replacing stale or duplicated memories over time.
+
+That matters for long-horizon work because the prompt only needs the current authoritative view of the user, the project, or the task. Older memories do not just pile up forever; they can be superseded, reviewed, or rejected.
+
+## Compared With Other Memory Kernels
+
+Many memory systems are just one of these:
+
+- an append-only vector store
+- a note bucket with retrieval on similarity alone
+- a prompt cache with no explicit lifecycle
+
+LIMN is different in a few ways:
+
+- it uses a typed decision step before storing memory at all
+- it keeps a durable local queue so turns are not lost on crash
+- it stores memory states like `AUTHORITATIVE`, `PENDING_CONFIRMATION`, `SUPERSEDED`, and `REJECTED`
+- it supports human review instead of assuming every extraction is correct
+- it separates model routing from memory routing, so the chat path and the memory path can evolve independently
+
+The tradeoff is that LIMN is more opinionated than a plain vector database. It is built for controlled long-horizon memory with review and replacement, not for dumping every trace into a bag of embeddings.
+
 ## Requirements
 
 - Go 1.22+
