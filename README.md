@@ -163,9 +163,9 @@ Export reviewed turns for training:
 
 ## AI Full Disclosure
 
-This software is developed with strong assistance from AI coding agents and with humans leading the ideas, testing, and debugging. We say this openly because it shaped how the project was built. If you are not happy with AI-developed code, this software is not for you.
+LIMN was built with strong assistance from AI coding agents. The ideas, testing, debugging, and final decisions were led by humans, and that shaped the router, daemon, Pi integration, and Laya-based decision flow.
 
-The acknowledgement below is equally important: this would not exist without llama.cpp and GGML, largely written by hand.
+If you are not comfortable using software developed with significant AI assistance, this project is probably not for you.
 
 ## Notes
 
