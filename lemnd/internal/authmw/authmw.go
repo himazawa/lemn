@@ -1,4 +1,4 @@
-// Package authmw provides a minimal shared-secret auth check for LIMN's
+// Package authmw provides a minimal shared-secret auth check for LEMN's
 // internal HTTP services. These services are meant to run on localhost
 // only, but "meant to" isn't enforcement — anything else on the box (or
 // a misconfigured bind address) can otherwise reach them. This closes

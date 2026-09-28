@@ -1,4 +1,4 @@
-package limn
+package lemn
 
 import (
 	"context"
@@ -84,7 +84,7 @@ func SupersedeMemory(ctx context.Context, db *sql.DB, oldID int, newMem MemoryNo
 	embeddingJSON, _ := json.Marshal(newMem.Embedding)
 
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO limn_memories (state, confidence, category, summary, rationale, embedding, provenance)
+		INSERT INTO lemn_memories (state, confidence, category, summary, rationale, embedding, provenance)
 		VALUES ('AUTHORITATIVE', $1, $2, $3, $4, $5, $6)
 		RETURNING id;`,
 		newMem.Confidence, newMem.Category, newMem.Summary, newMem.Rationale, string(embeddingJSON), provenanceJSON,
@@ -93,17 +93,17 @@ func SupersedeMemory(ctx context.Context, db *sql.DB, oldID int, newMem MemoryNo
 		return 0, fmt.Errorf("failed to insert new authoritative memory: %w", err)
 	}
 
-	if _, err = tx.ExecContext(ctx, `UPDATE limn_memories SET state = 'SUPERSEDED' WHERE id = $1`, oldID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE lemn_memories SET state = 'SUPERSEDED' WHERE id = $1`, oldID); err != nil {
 		return 0, fmt.Errorf("failed to mark old memory superseded: %w", err)
 	}
 
-	if _, err = tx.ExecContext(ctx, `INSERT INTO limn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'supersedes')`, newID, oldID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'supersedes')`, newID, oldID); err != nil {
 		return 0, fmt.Errorf("failed to write supersedes edge: %w", err)
 	}
 
 	if _, err = tx.ExecContext(ctx, `
-		UPDATE limn_memories SET state = 'NEEDS_REVALIDATION'
-		WHERE id IN (SELECT source_id FROM limn_edges WHERE target_id = $1 AND relationship = 'depends_on')`, oldID); err != nil {
+		UPDATE lemn_memories SET state = 'NEEDS_REVALIDATION'
+		WHERE id IN (SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on')`, oldID); err != nil {
 		return 0, fmt.Errorf("failed to invalidate dependent nodes: %w", err)
 	}
 
@@ -119,7 +119,7 @@ func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) 
 	embeddingJSON, _ := json.Marshal(mem.Embedding)
 
 	err := db.QueryRowContext(ctx, `
-		INSERT INTO limn_memories (state, confidence, category, summary, rationale, embedding, provenance)
+		INSERT INTO lemn_memories (state, confidence, category, summary, rationale, embedding, provenance)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
 		RETURNING id;`,
 		mem.State, mem.Confidence, mem.Category, mem.Summary, mem.Rationale, string(embeddingJSON), provenanceJSON,
@@ -144,7 +144,7 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int) error 
 	var state string
 	var provenanceJSON []byte
 	err = tx.QueryRowContext(ctx, `
-		SELECT state, provenance FROM limn_memories WHERE id = $1 FOR UPDATE`, pendingID,
+		SELECT state, provenance FROM lemn_memories WHERE id = $1 FOR UPDATE`, pendingID,
 	).Scan(&state, &provenanceJSON)
 	if err != nil {
 		return fmt.Errorf("failed to fetch pending memory #%d: %w", pendingID, err)
@@ -172,20 +172,20 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int) error 
 	}
 
 	if hasSingleTarget {
-		if _, err := tx.ExecContext(ctx, `UPDATE limn_memories SET state = 'SUPERSEDED' WHERE id = $1`, targetID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE lemn_memories SET state = 'SUPERSEDED' WHERE id = $1`, targetID); err != nil {
 			return fmt.Errorf("failed to mark target #%d superseded: %w", targetID, err)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO limn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'supersedes')`, pendingID, targetID); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'supersedes')`, pendingID, targetID); err != nil {
 			return fmt.Errorf("failed to write supersedes edge: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `
-			UPDATE limn_memories SET state = 'NEEDS_REVALIDATION'
-			WHERE id IN (SELECT source_id FROM limn_edges WHERE target_id = $1 AND relationship = 'depends_on')`, targetID); err != nil {
+			UPDATE lemn_memories SET state = 'NEEDS_REVALIDATION'
+			WHERE id IN (SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on')`, targetID); err != nil {
 			return fmt.Errorf("failed to invalidate dependent nodes: %w", err)
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `UPDATE limn_memories SET state = 'AUTHORITATIVE' WHERE id = $1`, pendingID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE lemn_memories SET state = 'AUTHORITATIVE' WHERE id = $1`, pendingID); err != nil {
 		return fmt.Errorf("failed to promote memory #%d: %w", pendingID, err)
 	}
 

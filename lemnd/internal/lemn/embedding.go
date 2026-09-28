@@ -1,4 +1,4 @@
-package limn
+package lemn
 
 import (
 	"bytes"

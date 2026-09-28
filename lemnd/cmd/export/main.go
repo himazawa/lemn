@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"limnd/internal/logstore"
+	"lemnd/internal/logstore"
 )
 
 type ChatMLItem struct {

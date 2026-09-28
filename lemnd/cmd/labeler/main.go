@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"limnd/internal/logstore"
+	"lemnd/internal/logstore"
 )
 
 func main() {

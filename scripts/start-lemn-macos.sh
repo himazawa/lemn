@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_DIR="${LIMN_RUN_DIR:-$ROOT_DIR/.limn-run}"
+RUN_DIR="${LEMN_RUN_DIR:-$ROOT_DIR/.lemn-run}"
 LOG_DIR="$RUN_DIR/logs"
 PID_DIR="$RUN_DIR/pids"
 VENV_DIR="$ROOT_DIR/layarouter/.venv"
@@ -63,23 +63,23 @@ start_process() {
 }
 
 write_env_file() {
-  cat > "$RUN_DIR/limn.env" <<EOF
-export LIMN_SHARED_SECRET='$LIMN_SHARED_SECRET'
-export LIMN_LAYA_URL='$LIMN_LAYA_URL'
-export LIMN_LAYA_MEMORY_URL='$LIMN_LAYA_MEMORY_URL'
+  cat > "$RUN_DIR/lemn.env" <<EOF
+export LEMN_SHARED_SECRET='$LEMN_SHARED_SECRET'
+export LEMN_LAYA_URL='$LEMN_LAYA_URL'
+export LEMN_LAYA_MEMORY_URL='$LEMN_LAYA_MEMORY_URL'
 export LAYA_MODEL_REPO='$LAYA_MODEL_REPO'
 export USE_TF='$USE_TF'
-export LIMN_POSTGRES_DSN='${LIMN_POSTGRES_DSN:-}'
+export LEMN_POSTGRES_DSN='${LEMN_POSTGRES_DSN:-}'
 EOF
 }
 
 build_go_binaries() {
   echo "Building Go binaries"
   (
-    cd "$ROOT_DIR/limnd"
+    cd "$ROOT_DIR/lemnd"
     go build -o bin/daemon  ./cmd/daemon
     go build -o bin/router  ./cmd/router
-    go build -o bin/limn    ./cmd/limn
+    go build -o bin/lemn    ./cmd/lemn
     go build -o bin/labeler ./cmd/labeler
     go build -o bin/export  ./cmd/export
   )
@@ -93,7 +93,7 @@ prepare_python_env() {
     return
   fi
 
-  if [[ "${LIMN_PIP_SYNC:-0}" == "1" ]]; then
+  if [[ "${LEMN_PIP_SYNC:-0}" == "1" ]]; then
     "$VENV_DIR/bin/pip" install -r "$ROOT_DIR/layarouter/requirements.txt"
   fi
 }
@@ -104,13 +104,13 @@ require_cmd go
 require_cmd openssl
 require_cmd python3
 
-export LIMN_SHARED_SECRET="${LIMN_SHARED_SECRET:-$(openssl rand -hex 32)}"
+export LEMN_SHARED_SECRET="${LEMN_SHARED_SECRET:-$(openssl rand -hex 32)}"
 export LAYA_MODEL_REPO="${LAYA_MODEL_REPO:-convaiinnovations/laya-typed-decisions}"
-export LIMN_LAYA_URL="${LIMN_LAYA_URL:-http://127.0.0.1:8002/classify}"
-export LIMN_LAYA_MEMORY_URL="${LIMN_LAYA_MEMORY_URL:-http://127.0.0.1:8002/memory-worthiness}"
+export LEMN_LAYA_URL="${LEMN_LAYA_URL:-http://127.0.0.1:8002/classify}"
+export LEMN_LAYA_MEMORY_URL="${LEMN_LAYA_MEMORY_URL:-http://127.0.0.1:8002/memory-worthiness}"
 export USE_TF="${USE_TF:-0}"
 
-if [[ "${LIMN_SKIP_BUILD:-0}" != "1" ]]; then
+if [[ "${LEMN_SKIP_BUILD:-0}" != "1" ]]; then
   build_go_binaries
 fi
 
@@ -118,8 +118,8 @@ prepare_python_env
 write_env_file
 
 start_process laya-service "source '$VENV_DIR/bin/activate' && cd '$ROOT_DIR/layarouter' && uvicorn server:app --host 127.0.0.1 --port 8002"
-start_process router "cd '$ROOT_DIR/limnd' && ./bin/router"
-start_process daemon "cd '$ROOT_DIR/limnd' && ./bin/daemon"
+start_process router "cd '$ROOT_DIR/lemnd' && ./bin/router"
+start_process daemon "cd '$ROOT_DIR/lemnd' && ./bin/daemon"
 
 wait_for_http laya-service "http://127.0.0.1:8002/healthz"
 wait_for_http router "http://127.0.0.1:8090/healthz"
@@ -127,19 +127,19 @@ wait_for_http daemon "http://127.0.0.1:8080/healthz"
 
 cat <<EOF
 
-LIMN is up.
+LEMN is up.
 
 Shared secret:
-  $LIMN_SHARED_SECRET
+  $LEMN_SHARED_SECRET
 
 Runtime env file:
-  $RUN_DIR/limn.env
+  $RUN_DIR/lemn.env
 
 Logs:
   $LOG_DIR
 
 Stop everything with:
-  $ROOT_DIR/scripts/stop-limn-macos.sh
+  $ROOT_DIR/scripts/stop-lemn-macos.sh
 
 Model backends should already be running in your UI.
 EOF

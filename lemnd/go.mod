@@ -1,4 +1,4 @@
-module limnd
+module lemnd
 
 go 1.22
 

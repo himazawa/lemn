@@ -1,6 +1,6 @@
-# LIMN — Local Epistemic Memory Kernel + Laya Model Router
+# LEMN — Local Epistemic Memory Kernel + Laya Model Router
 
-LIMN is a small local system for two related jobs:
+LEMN is a small local system for two related jobs:
 
 1. route chat requests to a fast or heavy model
 2. decide which turns are worth storing as long-term memory
@@ -17,11 +17,11 @@ It uses:
 
 | Component | Language | Purpose |
 |---|---|---|
-| `limnd/cmd/router` | Go | OpenAI-compatible proxy that routes each request to fast or heavy chat models |
-| `limnd/cmd/daemon` | Go | Durably ingests turns, decides whether they are memory-worthy, and routes approved memories into the kernel |
-| `limnd/cmd/limn` | Go | Admin CLI for reviewing pending memories |
-| `limnd/cmd/labeler` | Go | Interactive tool for reviewing unlabelled turns |
-| `limnd/cmd/export` | Go | Exports reviewed turns to JSONL for training |
+| `lemnd/cmd/router` | Go | OpenAI-compatible proxy that routes each request to fast or heavy chat models |
+| `lemnd/cmd/daemon` | Go | Durably ingests turns, decides whether they are memory-worthy, and routes approved memories into the kernel |
+| `lemnd/cmd/lemn` | Go | Admin CLI for reviewing pending memories |
+| `lemnd/cmd/labeler` | Go | Interactive tool for reviewing unlabelled turns |
+| `lemnd/cmd/export` | Go | Exports reviewed turns to JSONL for training |
 | `layarouter/server.py` | Python | Laya typed-decision service for `/classify` and `/memory-worthiness` |
 | `pi-extension/` | TypeScript | Pi hooks for memory read/write integration |
 | `schema.sql` | SQL | PostgreSQL + pgvector schema for the kernel |
@@ -38,7 +38,7 @@ It uses:
 
 ## Why This Helps Long-Horizon Use
 
-LIMN is useful when the conversation has to stay coherent across many turns, sessions, or even days.
+LEMN is useful when the conversation has to stay coherent across many turns, sessions, or even days.
 
 It helps because it does not treat memory as a single flat log. It separates raw turn capture, memory-worthiness gating, extraction, retrieval, and supersession, so the system can keep useful information while still replacing stale or duplicated memories over time.
 
@@ -52,7 +52,7 @@ Many memory systems are just one of these:
 - a note bucket with retrieval on similarity alone
 - a prompt cache with no explicit lifecycle
 
-LIMN is different in a few ways:
+LEMN is different in a few ways:
 
 - it uses a typed decision step before storing memory at all
 - it keeps a durable local queue so turns are not lost on crash
@@ -60,7 +60,7 @@ LIMN is different in a few ways:
 - it supports human review instead of assuming every extraction is correct
 - it separates model routing from memory routing, so the chat path and the memory path can evolve independently
 
-The tradeoff is that LIMN is more opinionated than a plain vector database. It is built for controlled long-horizon memory with review and replacement, not for dumping every trace into a bag of embeddings.
+The tradeoff is that LEMN is more opinionated than a plain vector database. It is built for controlled long-horizon memory with review and replacement, not for dumping every trace into a bag of embeddings.
 
 Fine-tuning the classifier can make this even better by reducing false positives and false negatives in the memory-worthiness gate, which means fewer useless memories stored and fewer good ones sent to human review.
 
@@ -88,8 +88,8 @@ How to fine-tune it:
 If your model servers are already running, the simplest macOS flow is:
 
 ```bash
-chmod +x ./scripts/start-limn-macos.sh ./scripts/stop-limn-macos.sh
-./scripts/start-limn-macos.sh
+chmod +x ./scripts/start-lemn-macos.sh ./scripts/stop-lemn-macos.sh
+./scripts/start-lemn-macos.sh
 ```
 
 That script starts the Laya service, router, and daemon, and expects your model endpoints to already be running.
@@ -99,13 +99,13 @@ That script starts the Laya service, router, and daemon, and expects your model 
 If you want to start each piece yourself:
 
 ```bash
-export LIMN_SHARED_SECRET=$(openssl rand -hex 32)
+export LEMN_SHARED_SECRET=$(openssl rand -hex 32)
 
-cd limnd
+cd lemnd
 go build -o bin/daemon  ./cmd/daemon
 go build -o bin/labeler ./cmd/labeler
 go build -o bin/export  ./cmd/export
-go build -o bin/limn    ./cmd/limn
+go build -o bin/lemn    ./cmd/lemn
 go build -o bin/router  ./cmd/router
 ```
 
@@ -122,18 +122,18 @@ USE_TF=0 uvicorn server:app --host 127.0.0.1 --port 8002
 Start the router:
 
 ```bash
-cd ../limnd
-export LIMN_SHARED_SECRET=$LIMN_SHARED_SECRET
-export LIMN_LAYA_URL=http://127.0.0.1:8002/classify
+cd ../lemnd
+export LEMN_SHARED_SECRET=$LEMN_SHARED_SECRET
+export LEMN_LAYA_URL=http://127.0.0.1:8002/classify
 ./bin/router
 ```
 
 Start the daemon:
 
 ```bash
-cd ../limnd
-export LIMN_SHARED_SECRET=$LIMN_SHARED_SECRET
-export LIMN_LAYA_MEMORY_URL=http://127.0.0.1:8002/memory-worthiness
+cd ../lemnd
+export LEMN_SHARED_SECRET=$LEMN_SHARED_SECRET
+export LEMN_LAYA_MEMORY_URL=http://127.0.0.1:8002/memory-worthiness
 ./bin/daemon
 ```
 
@@ -146,9 +146,9 @@ Use these commands to review memory state after the daemon has compared a new me
 Review pending memories:
 
 ```bash
-cd limnd
-export LIMN_POSTGRES_DSN="postgres://limn:CHANGE_ME@localhost:5432/limn_kernel?sslmode=disable"
-./bin/limn pending
+cd lemnd
+export LEMN_POSTGRES_DSN="postgres://lemn:CHANGE_ME@localhost:5432/lemn_kernel?sslmode=disable"
+./bin/lemn pending
 ```
 
 `confirm` promotes a `PENDING_CONFIRMATION` memory to `AUTHORITATIVE`. If it replaces an older memory, the older one is marked `SUPERSEDED`.
@@ -156,7 +156,7 @@ export LIMN_POSTGRES_DSN="postgres://limn:CHANGE_ME@localhost:5432/limn_kernel?s
 Confirm a memory:
 
 ```bash
-./bin/limn confirm <id>
+./bin/lemn confirm <id>
 ```
 
 `reject` leaves the current `AUTHORITATIVE` memory in place and marks the pending one as `REJECTED`.
@@ -164,7 +164,7 @@ Confirm a memory:
 Reject a memory:
 
 ```bash
-./bin/limn reject <id>
+./bin/lemn reject <id>
 ```
 
 Review unlabelled turns:
@@ -183,15 +183,15 @@ Export reviewed turns for training:
 
 | Variable | Default | Used by |
 |---|---|---|
-| `LIMN_SHARED_SECRET` | required | daemon, router, Laya service, Pi |
-| `LIMN_DAEMON_BIND` | `127.0.0.1:8080` | daemon |
-| `LIMN_ROUTER_BIND` | `127.0.0.1:8090` | router |
-| `LIMN_LAYA_URL` | `http://localhost:8002/classify` | router |
-| `LIMN_LAYA_MEMORY_URL` | `http://localhost:8002/memory-worthiness` | daemon |
+| `LEMN_SHARED_SECRET` | required | daemon, router, Laya service, Pi |
+| `LEMN_DAEMON_BIND` | `127.0.0.1:8080` | daemon |
+| `LEMN_ROUTER_BIND` | `127.0.0.1:8090` | router |
+| `LEMN_LAYA_URL` | `http://localhost:8002/classify` | router |
+| `LEMN_LAYA_MEMORY_URL` | `http://localhost:8002/memory-worthiness` | daemon |
 | `LAYA_MODEL_REPO` | `convaiinnovations/laya-typed-decisions` | Laya service |
 | `LAYA_MEMORY_THRESHOLD` | `0.5` | Laya service |
-| `LIMN_WORKER_COUNT` | `2` | daemon |
-| `LIMN_POSTGRES_DSN` | required for kernel/admin commands | daemon, `cmd/limn` |
+| `LEMN_WORKER_COUNT` | `2` | daemon |
+| `LEMN_POSTGRES_DSN` | required for kernel/admin commands | daemon, `cmd/lemn` |
 | `USE_TF` | `0` | Laya service |
 
 ## Ports
@@ -203,17 +203,17 @@ Export reviewed turns for training:
 | 8002 | Laya classifier service |
 | 8010 | fast chat model |
 | 8011 | heavy chat model |
-| 8080 | LIMN daemon |
-| 8090 | LIMN router |
+| 8080 | LEMN daemon |
+| 8090 | LEMN router |
 
 ## AI Full Disclosure
 
-LIMN was built with strong assistance from AI coding agents. The ideas, testing, debugging, and final decisions were led by humans, and that shaped the router, daemon, Pi integration, and Laya-based decision flow.
+LEMN was built with strong assistance from AI coding agents. The ideas, testing, debugging, and final decisions were led by humans, and that shaped the router, daemon, Pi integration, and Laya-based decision flow.
 
 If you are not comfortable using software developed with significant AI assistance, this project is probably not for you.
 
 ## Notes
 
 - The daemon uses SQLite for its durable queue and PostgreSQL for the kernel.
-- Pi does not have its own memory admin commands; use `limn pending`, `confirm`, and `reject`.
+- Pi does not have its own memory admin commands; use `lemn pending`, `confirm`, and `reject`.
 - The router and daemon expect OpenAI-compatible HTTP endpoints.

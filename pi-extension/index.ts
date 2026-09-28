@@ -1,24 +1,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { injectMemoryToUserTail } from "./retrieval";
 
-// Must match LIMN_SHARED_SECRET configured on the daemon. Set this in
+// Must match LEMN_SHARED_SECRET configured on the daemon. Set this in
 // Pi's own environment/config — never hardcode it in source.
-const LIMN_SHARED_SECRET = process.env.LIMN_SHARED_SECRET || "";
+const LEMN_SHARED_SECRET = process.env.LEMN_SHARED_SECRET || "";
 
 function authHeaders(): Record<string, string> {
   return {
     "Content-Type": "application/json",
-    "Authorization": `Bearer ${LIMN_SHARED_SECRET}`
+    "Authorization": `Bearer ${LEMN_SHARED_SECRET}`
   };
 }
 
-export default function limnExtension(pi: ExtensionAPI) {
-  if (!LIMN_SHARED_SECRET) {
+export default function lemnExtension(pi: ExtensionAPI) {
+  if (!LEMN_SHARED_SECRET) {
     // Fail loud in logs rather than silently sending unauthenticated
     // requests that the daemon will reject one by one.
     console.error(
-      "[limn] LIMN_SHARED_SECRET is not set — the daemon will reject all requests. " +
-      "Set it in Pi's environment to the same value configured on limnd."
+      "[lemn] LEMN_SHARED_SECRET is not set — the daemon will reject all requests. " +
+      "Set it in Pi's environment to the same value configured on lemnd."
     );
   }
 

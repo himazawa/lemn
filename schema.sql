@@ -1,6 +1,6 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
-CREATE TABLE limn_memories (
+CREATE TABLE lemn_memories (
     id SERIAL PRIMARY KEY,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     state TEXT NOT NULL DEFAULT 'CANDIDATE', -- OBSERVED, CANDIDATE, AUTHORITATIVE, PENDING, PENDING_CONFIRMATION, SUPERSEDED, CONTRADICTED, NEEDS_REVALIDATION, REJECTED
@@ -12,9 +12,9 @@ CREATE TABLE limn_memories (
     provenance JSONB NOT NULL
 );
 
-CREATE TABLE limn_edges (
-    source_id INT REFERENCES limn_memories(id),
-    target_id INT REFERENCES limn_memories(id),
+CREATE TABLE lemn_edges (
+    source_id INT REFERENCES lemn_memories(id),
+    target_id INT REFERENCES lemn_memories(id),
     relationship TEXT NOT NULL, -- "supersedes", "contradicts", "depends_on"
     PRIMARY KEY (source_id, target_id)
 );

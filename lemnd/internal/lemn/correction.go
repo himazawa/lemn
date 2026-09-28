@@ -1,4 +1,4 @@
-package limn
+package lemn
 
 import (
 	"context"
@@ -27,7 +27,7 @@ func findSimilarAuthoritative(ctx context.Context, db *sql.DB, embedding []float
 	embeddingJSON, _ := json.Marshal(embedding)
 	rows, err := db.QueryContext(ctx, `
 		SELECT id, summary, 1 - (embedding <=> $1::vector) as similarity
-		FROM limn_memories
+		FROM lemn_memories
 		WHERE state = 'AUTHORITATIVE' AND 1 - (embedding <=> $1::vector) > $2
 		ORDER BY similarity DESC LIMIT 5;`,
 		string(embeddingJSON), threshold)

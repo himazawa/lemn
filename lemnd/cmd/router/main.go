@@ -1,7 +1,7 @@
-// LIMN Model Router
+// LEMN Model Router
 //
 // Point Pi's model base_url at this service (http://localhost:8090/v1)
-// and its api_key at LIMN_SHARED_SECRET's value — OpenAI-compatible
+// and its api_key at LEMN_SHARED_SECRET's value — OpenAI-compatible
 // clients send that as "Authorization: Bearer <api_key>" by convention,
 // which is exactly what this service's auth check expects, so no
 // Pi-side code changes are needed beyond the standard config fields.
@@ -27,7 +27,7 @@ import (
 	"os"
 	"time"
 
-	"limnd/internal/authmw"
+	"lemnd/internal/authmw"
 )
 
 type chatMessage struct {
@@ -49,10 +49,10 @@ type classifyResponse struct {
 }
 
 var (
-	layaEndpoint    = getenv("LIMN_LAYA_URL", "http://localhost:8002/classify")
-	fastModelURL    = getenv("LIMN_FAST_MODEL_URL", "http://localhost:8010/v1/chat/completions")
-	heavyModelURL   = getenv("LIMN_HEAVY_MODEL_URL", "http://localhost:8011/v1/chat/completions")
-	routerBind      = getenv("LIMN_ROUTER_BIND", "127.0.0.1:8090")
+	layaEndpoint    = getenv("LEMN_LAYA_URL", "http://localhost:8002/classify")
+	fastModelURL    = getenv("LEMN_FAST_MODEL_URL", "http://localhost:8010/v1/chat/completions")
+	heavyModelURL   = getenv("LEMN_HEAVY_MODEL_URL", "http://localhost:8011/v1/chat/completions")
+	routerBind      = getenv("LEMN_ROUTER_BIND", "127.0.0.1:8090")
 	classifyTimeout = 2 * time.Second
 	backendTimeout  = 5 * time.Minute // generous — this covers full generation, not just connect
 	sharedSecret    string
@@ -66,9 +66,9 @@ func getenv(key, def string) string {
 }
 
 func main() {
-	sharedSecret = os.Getenv("LIMN_SHARED_SECRET")
+	sharedSecret = os.Getenv("LEMN_SHARED_SECRET")
 	if sharedSecret == "" {
-		log.Fatal("LIMN_SHARED_SECRET is not set — refusing to start unauthenticated. " +
+		log.Fatal("LEMN_SHARED_SECRET is not set — refusing to start unauthenticated. " +
 			"Set it to the same value configured on the daemon and Laya service, " +
 			"and set it as Pi's model api_key.")
 	}
@@ -78,7 +78,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	log.Printf("LIMN model router listening on %s (fast=%s, heavy=%s, laya=%s)",
+	log.Printf("LEMN model router listening on %s (fast=%s, heavy=%s, laya=%s)",
 		routerBind, fastModelURL, heavyModelURL, layaEndpoint)
 	log.Fatal(http.ListenAndServe(routerBind, nil))
 }

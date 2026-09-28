@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUN_DIR="${LIMN_RUN_DIR:-$ROOT_DIR/.limn-run}"
+RUN_DIR="${LEMN_RUN_DIR:-$ROOT_DIR/.lemn-run}"
 PID_DIR="$RUN_DIR/pids"
 
 if [[ ! -d "$PID_DIR" ]]; then
@@ -25,4 +25,4 @@ for pid_file in "$PID_DIR"/*.pid; do
   rm -f "$pid_file"
 done
 
-echo "All tracked LIMN processes have been signaled to stop."
+echo "All tracked LEMN processes have been signaled to stop."

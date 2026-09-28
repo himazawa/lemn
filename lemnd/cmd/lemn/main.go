@@ -12,13 +12,13 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"limnd/internal/limn"
+	"lemnd/internal/lemn"
 )
 
 func main() {
-	dsn := os.Getenv("LIMN_POSTGRES_DSN")
+	dsn := os.Getenv("LEMN_POSTGRES_DSN")
 	if dsn == "" {
-		log.Fatal("LIMN_POSTGRES_DSN is not set — refusing to fall back to a default credential. " +
+		log.Fatal("LEMN_POSTGRES_DSN is not set — refusing to fall back to a default credential. " +
 			"Set it to the same DSN used by the daemon.")
 	}
 
@@ -39,13 +39,13 @@ func main() {
 		listPending(db)
 	case "confirm":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: limn confirm <memory_id>")
+			fmt.Println("Usage: lemn confirm <memory_id>")
 			return
 		}
 		confirmMemory(db, os.Args[2])
 	case "reject":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: limn reject <memory_id>")
+			fmt.Println("Usage: lemn reject <memory_id>")
 			return
 		}
 		rejectMemory(db, os.Args[2])
@@ -55,16 +55,16 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("LIMN Admin CLI")
-	fmt.Println("  limn pending           - List all memories in PENDING or PENDING_CONFIRMATION state")
-	fmt.Println("  limn confirm <id>      - Promote pending memory to AUTHORITATIVE (supersedes its linked target, if any)")
-	fmt.Println("  limn reject <id>       - Transition pending memory to REJECTED")
+	fmt.Println("LEMN Admin CLI")
+	fmt.Println("  lemn pending           - List all memories in PENDING or PENDING_CONFIRMATION state")
+	fmt.Println("  lemn confirm <id>      - Promote pending memory to AUTHORITATIVE (supersedes its linked target, if any)")
+	fmt.Println("  lemn reject <id>       - Transition pending memory to REJECTED")
 }
 
 func listPending(db *sql.DB) {
 	rows, err := db.Query(`
 		SELECT id, state, category, summary, confidence, provenance 
-		FROM limn_memories 
+		FROM lemn_memories 
 		WHERE state IN ('PENDING', 'PENDING_CONFIRMATION') 
 		ORDER BY created_at DESC;`)
 	if err != nil {
@@ -113,14 +113,14 @@ func confirmMemory(db *sql.DB, idStr string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := limn.ConfirmPendingMemory(ctx, db, id); err != nil {
+	if err := lemn.ConfirmPendingMemory(ctx, db, id); err != nil {
 		log.Fatalf("Failed to confirm memory #%d: %v", id, err)
 	}
 	fmt.Printf("Memory #%d successfully promoted to AUTHORITATIVE (prior target superseded if one was linked).\n", id)
 }
 
 func rejectMemory(db *sql.DB, idStr string) {
-	_, err := db.Exec("UPDATE limn_memories SET state = 'REJECTED' WHERE id = $1", idStr)
+	_, err := db.Exec("UPDATE lemn_memories SET state = 'REJECTED' WHERE id = $1", idStr)
 	if err != nil {
 		log.Fatalf("Failed to reject memory #%s: %v", idStr, err)
 	}

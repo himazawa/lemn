@@ -7,7 +7,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const DSN = "file:./limn_data.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+const DSN = "file:./lemn_data.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 
 func Open() (*sql.DB, error) {
 	db, err := sql.Open("sqlite", DSN)

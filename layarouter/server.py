@@ -1,5 +1,5 @@
 """
-LIMN Laya Classifier Service
+LEMN Laya Classifier Service
 ----------------------------
 Wraps the Laya typed-decisions checkpoint
 (convaiinnovations/laya-typed-decisions) behind a small HTTP endpoint
@@ -36,10 +36,10 @@ MODEL_REPO = os.environ.get("LAYA_MODEL_REPO", "convaiinnovations/laya-typed-dec
 THRESHOLD = float(os.environ.get("LAYA_ROUTING_THRESHOLD", "0.5"))
 MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.5"))
 
-SHARED_SECRET = os.environ.get("LIMN_SHARED_SECRET")
+SHARED_SECRET = os.environ.get("LEMN_SHARED_SECRET")
 if not SHARED_SECRET:
     raise RuntimeError(
-        "LIMN_SHARED_SECRET is not set — refusing to start unauthenticated. "
+        "LEMN_SHARED_SECRET is not set — refusing to start unauthenticated. "
         "Set it to the same value configured on the router and daemon."
     )
 
@@ -54,7 +54,7 @@ def require_auth(authorization: str = Header(default="")) -> None:
         raise HTTPException(status_code=401, detail="invalid bearer token")
 
 
-app = FastAPI(title="LIMN Laya Classifier")
+app = FastAPI(title="LEMN Laya Classifier")
 
 agent = laya.load(MODEL_REPO)
 

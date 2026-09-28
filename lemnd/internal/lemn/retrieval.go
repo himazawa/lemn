@@ -1,4 +1,4 @@
-package limn
+package lemn
 
 import (
 	"context"
@@ -21,7 +21,7 @@ func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string
 
 	query := `
 		SELECT id, category, summary, 1 - (embedding <=> $1::vector) as similarity
-		FROM limn_memories
+		FROM lemn_memories
 		WHERE state = 'AUTHORITATIVE'
 		  AND 1 - (embedding <=> $1::vector) > 0.75
 		ORDER BY similarity DESC

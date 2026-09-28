@@ -15,25 +15,25 @@ import (
 
 	_ "github.com/lib/pq"
 
-	"limnd/internal/authmw"
-	"limnd/internal/limn"
-	"limnd/internal/logstore"
+	"lemnd/internal/authmw"
+	"lemnd/internal/lemn"
+	"lemnd/internal/logstore"
 )
 
 var (
-	layaMemoryURL = getenv("LIMN_LAYA_MEMORY_URL", "http://localhost:8002/memory-worthiness")
+	layaMemoryURL = getenv("LEMN_LAYA_MEMORY_URL", "http://localhost:8002/memory-worthiness")
 	sharedSecret  string
 )
 
 func main() {
-	sharedSecret = os.Getenv("LIMN_SHARED_SECRET")
+	sharedSecret = os.Getenv("LEMN_SHARED_SECRET")
 	if sharedSecret == "" {
-		log.Fatal("LIMN_SHARED_SECRET is not set — refusing to start unauthenticated. " +
+		log.Fatal("LEMN_SHARED_SECRET is not set — refusing to start unauthenticated. " +
 			"Set it to a long random value and configure the same value in Pi and the router.")
 	}
 
-	bindAddr := getenv("LIMN_DAEMON_BIND", "127.0.0.1:8080")
-	workerCount := getenvInt("LIMN_WORKER_COUNT", 2)
+	bindAddr := getenv("LEMN_DAEMON_BIND", "127.0.0.1:8080")
+	workerCount := getenvInt("LEMN_WORKER_COUNT", 2)
 
 	sqliteDB, err := logstore.Open()
 	if err != nil {
@@ -48,15 +48,15 @@ func main() {
 	}
 
 	var pgDB *sql.DB
-	if dsn := os.Getenv("LIMN_POSTGRES_DSN"); dsn != "" {
+	if dsn := os.Getenv("LEMN_POSTGRES_DSN"); dsn != "" {
 		pgDB, err = sql.Open("postgres", dsn)
 		if err != nil {
 			log.Fatalf("Failed to open Postgres kernel DB: %v", err)
 		}
 		defer pgDB.Close()
-		log.Println("Postgres kernel ENABLED — extractions will be routed through limn.RouteExtraction")
+		log.Println("Postgres kernel ENABLED — extractions will be routed through lemn.RouteExtraction")
 	} else {
-		log.Println("Postgres kernel DISABLED (no LIMN_POSTGRES_DSN) — bootstrap logging only")
+		log.Println("Postgres kernel DISABLED (no LEMN_POSTGRES_DSN) — bootstrap logging only")
 	}
 
 	// Start the durable job workers. Each worker polls memory_jobs for a
@@ -75,7 +75,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	fmt.Printf("LIMN Go daemon listening on %s...\n", bindAddr)
+	fmt.Printf("LEMN Go daemon listening on %s...\n", bindAddr)
 	log.Fatal(http.ListenAndServe(bindAddr, nil))
 }
 
@@ -107,7 +107,7 @@ func handleLog(sqliteDB *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		var payload limn.TurnPayload
+		var payload lemn.TurnPayload
 		if err := json.Unmarshal(bodyBytes, &payload); err != nil {
 			http.Error(w, "invalid turn payload: "+err.Error(), http.StatusBadRequest)
 			return
@@ -134,11 +134,11 @@ func handleRetrieve(pgDB *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pgDB == nil {
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]limn.RetrievedMemory{})
+			json.NewEncoder(w).Encode([]lemn.RetrievedMemory{})
 			return
 		}
 
-		var req limn.RetrievalRequest
+		var req lemn.RetrievalRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -147,11 +147,11 @@ func handleRetrieve(pgDB *sql.DB) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		memories, err := limn.QueryAuthoritativeMemories(ctx, pgDB, req.Query, req.Limit)
+		memories, err := lemn.QueryAuthoritativeMemories(ctx, pgDB, req.Query, req.Limit)
 		if err != nil {
 			log.Printf("[Retrieval Error]: %v", err)
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode([]limn.RetrievedMemory{})
+			json.NewEncoder(w).Encode([]lemn.RetrievedMemory{})
 			return
 		}
 
@@ -207,7 +207,7 @@ func runWorker(id int, sqliteDB, pgDB *sql.DB, stop <-chan struct{}) {
 }
 
 func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
-	var t limn.TurnPayload
+	var t lemn.TurnPayload
 	if err := json.Unmarshal(job.RawPayload, &t); err != nil {
 		return fmt.Errorf("corrupt job payload: %w", err)
 	}
@@ -237,7 +237,7 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	memID, err := limn.RouteExtraction(ctx, pgDB, t, extraction)
+	memID, err := lemn.RouteExtraction(ctx, pgDB, t, extraction)
 	if err != nil {
 		return fmt.Errorf("kernel routing failed: %w", err)
 	}
@@ -247,13 +247,13 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 	return nil
 }
 
-func runZeroShotExtraction(t limn.TurnPayload) (limn.ModelExtraction, error) {
+func runZeroShotExtraction(t lemn.TurnPayload) (lemn.ModelExtraction, error) {
 	memoryWorthy, probability, err := decideMemoryWorthiness(t)
 	if err != nil {
-		return limn.ModelExtraction{}, err
+		return lemn.ModelExtraction{}, err
 	}
 	if !memoryWorthy {
-		return limn.ModelExtraction{
+		return lemn.ModelExtraction{
 			MemoryWorthy: false,
 			Type:         "none",
 			Confidence:   probability,
@@ -280,12 +280,12 @@ Respond ONLY with JSON matching this format:
 	client := http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Post("http://localhost:8000/v1/chat/completions", "application/json", bytes.NewBuffer(reqBody))
 	if err != nil {
-		return limn.ModelExtraction{}, fmt.Errorf("HTTP request failed: %w", err)
+		return lemn.ModelExtraction{}, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return limn.ModelExtraction{}, fmt.Errorf("LLM API returned status %d", resp.StatusCode)
+		return lemn.ModelExtraction{}, fmt.Errorf("LLM API returned status %d", resp.StatusCode)
 	}
 
 	var result struct {
@@ -296,10 +296,10 @@ Respond ONLY with JSON matching this format:
 		} `json:"choices"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return limn.ModelExtraction{}, fmt.Errorf("JSON decode error: %w", err)
+		return lemn.ModelExtraction{}, fmt.Errorf("JSON decode error: %w", err)
 	}
 	if len(result.Choices) == 0 {
-		return limn.ModelExtraction{}, fmt.Errorf("empty choices array from LLM")
+		return lemn.ModelExtraction{}, fmt.Errorf("empty choices array from LLM")
 	}
 
 	var payload struct {
@@ -308,10 +308,10 @@ Respond ONLY with JSON matching this format:
 		Confidence float64 `json:"confidence"`
 	}
 	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), &payload); err != nil {
-		return limn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
+		return lemn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
 	}
 
-	return limn.ModelExtraction{
+	return lemn.ModelExtraction{
 		MemoryWorthy: true,
 		Type:         payload.Type,
 		Summary:      payload.Summary,
@@ -319,7 +319,7 @@ Respond ONLY with JSON matching this format:
 	}, nil
 }
 
-func decideMemoryWorthiness(t limn.TurnPayload) (bool, float64, error) {
+func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, error) {
 	reqBody, _ := json.Marshal(map[string]string{
 		"user_message":       t.UserMessage,
 		"assistant_response": t.AssistantResponse,
