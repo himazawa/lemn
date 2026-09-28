@@ -24,7 +24,7 @@ services:
       LAYA_MODEL_REPO: ${LAYA_MODEL_REPO:-convaiinnovations/laya-typed-decisions}
       LAYA_ROUTING_THRESHOLD: ${LAYA_ROUTING_THRESHOLD:-0.38}
       LAYA_MEMORY_THRESHOLD: ${LAYA_MEMORY_THRESHOLD:-0.5}
-      LAYA_GLOBAL_THRESHOLD: ${LAYA_GLOBAL_THRESHOLD:-0.67}
+      LAYA_GLOBAL_THRESHOLD: ${LAYA_GLOBAL_THRESHOLD:-0.90}
     volumes:
       - hfcache:/hf-cache
     healthcheck:
