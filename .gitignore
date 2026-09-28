@@ -1,0 +1,15 @@
+# Secrets — .env holds LEMN_SHARED_SECRET and the Postgres password.
+# .env.example is the committed template and must stay tracked.
+.env
+.env.*
+!.env.example
+
+# Installed copies of pi-extension/; the canonical source lives there.
+.pi/
+
+.lemn-run/
+lemnd/bin/
+lemnd/lemn_data.db*
+lemnd/data/
+layarouter/.venv/
+__pycache__/

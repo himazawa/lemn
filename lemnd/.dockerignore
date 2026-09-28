@@ -1,0 +1,4 @@
+bin/
+lemn_data.db*
+data/
+Dockerfile

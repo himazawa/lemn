@@ -63,7 +63,7 @@ func printUsage() {
 
 func listPending(db *sql.DB) {
 	rows, err := db.Query(`
-		SELECT id, state, category, summary, confidence, provenance 
+		SELECT id, state, project_id, category, summary, confidence, provenance 
 		FROM lemn_memories 
 		WHERE state IN ('PENDING', 'PENDING_CONFIRMATION') 
 		ORDER BY created_at DESC;`)
@@ -76,14 +76,14 @@ func listPending(db *sql.DB) {
 	count := 0
 	for rows.Next() {
 		var id int
-		var state, category, summary string
+		var state, projectID, category, summary string
 		var confidence float64
 		var provenanceJSON []byte
 
-		rows.Scan(&id, &state, &category, &summary, &confidence, &provenanceJSON)
+		rows.Scan(&id, &state, &projectID, &category, &summary, &confidence, &provenanceJSON)
 		count++
 
-		fmt.Printf("\n[#%d] State: %s | Category: %s | Confidence: %.2f\n", id, state, category, confidence)
+		fmt.Printf("\n[#%d] State: %s | Project: %s | Category: %s | Confidence: %.2f\n", id, state, projectID, category, confidence)
 		fmt.Printf("      Summary: %s\n", summary)
 		if len(provenanceJSON) > 0 {
 			var prov map[string]interface{}

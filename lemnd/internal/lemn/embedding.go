@@ -7,21 +7,32 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
 )
 
-const embeddingEndpoint = "http://localhost:8001/v1/embeddings"
+func getenv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 func getEmbedding(ctx context.Context, text string) ([]float32, error) {
+	endpoint := getenv("LEMN_EMBEDDING_URL", "http://localhost:8001/v1/embeddings")
+
 	reqBody, _ := json.Marshal(map[string]any{
-		"model": "bge-large-en-v1.5",
+		"model": getenv("LEMN_EMBEDDING_MODEL", "bge-m3"),
 		"input": text,
 	})
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, embeddingEndpoint, bytes.NewBuffer(reqBody))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build embedding request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if key := os.Getenv("LEMN_BACKEND_API_KEY"); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

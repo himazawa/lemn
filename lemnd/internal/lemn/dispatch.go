@@ -16,7 +16,13 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 		return 0, fmt.Errorf("failed to embed extraction summary: %w", err)
 	}
 
+	scope := NormalizeScope(t.ProjectID)
+	if ext.GlobalScoped {
+		scope = GlobalScope
+	}
+
 	mem := MemoryNode{
+		ProjectID:  scope,
 		Confidence: ext.Confidence,
 		Category:   ext.Type,
 		Summary:    ext.Summary,

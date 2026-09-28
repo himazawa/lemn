@@ -1,0 +1,108 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-lemn}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-lemn_kernel}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-lemn} -d ${POSTGRES_DB:-lemn_kernel}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  laya:
+    build: ./layarouter
+    ports:
+      - "${LAYA_PORT:-8002}:8002"
+    environment:
+      LEMN_SHARED_SECRET: ${LEMN_SHARED_SECRET:?set LEMN_SHARED_SECRET in .env}
+      LAYA_MODEL_REPO: ${LAYA_MODEL_REPO:-convaiinnovations/laya-typed-decisions}
+      LAYA_ROUTING_THRESHOLD: ${LAYA_ROUTING_THRESHOLD:-0.5}
+      LAYA_MEMORY_THRESHOLD: ${LAYA_MEMORY_THRESHOLD:-0.5}
+      LAYA_GLOBAL_THRESHOLD: ${LAYA_GLOBAL_THRESHOLD:-0.67}
+    volumes:
+      - hfcache:/hf-cache
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8002/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 300s # first boot downloads the checkpoint from HuggingFace
+    restart: unless-stopped
+
+  router:
+    build: ./lemnd
+    command: ["router"]
+    ports:
+      - "${ROUTER_PORT:-8090}:8090"
+    # Linux only: Docker Desktop provides host.docker.internal natively, and
+    # overriding it there points at the VM's bridge instead of the host.
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    environment:
+      LEMN_SHARED_SECRET: ${LEMN_SHARED_SECRET:?set LEMN_SHARED_SECRET in .env}
+      LEMN_ROUTER_BIND: 0.0.0.0:8090
+      LEMN_LAYA_URL: http://laya:8002/classify
+      LEMN_FAST_MODEL_URL: ${LEMN_FAST_MODEL_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/chat/completions}
+      LEMN_HEAVY_MODEL_URL: ${LEMN_HEAVY_MODEL_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/chat/completions}
+      LEMN_FAST_MODEL_NAME: ${LEMN_FAST_MODEL_NAME:-}
+      LEMN_HEAVY_MODEL_NAME: ${LEMN_HEAVY_MODEL_NAME:-}
+      LEMN_BACKEND_API_KEY: ${LEMN_BACKEND_API_KEY:-}
+      LEMN_CLASSIFY_TIMEOUT: ${LEMN_CLASSIFY_TIMEOUT:-5s}
+    depends_on:
+      laya:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8090/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  daemon:
+    build: ./lemnd
+    command: ["daemon"]
+    ports:
+      - "${DAEMON_PORT:-8080}:8080"
+    # Linux only — see the note on the router service.
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+    environment:
+      LEMN_SHARED_SECRET: ${LEMN_SHARED_SECRET:?set LEMN_SHARED_SECRET in .env}
+      LEMN_DAEMON_BIND: 0.0.0.0:8080
+      LEMN_LAYA_MEMORY_URL: http://laya:8002/memory-worthiness
+      LEMN_WORKER_COUNT: ${LEMN_WORKER_COUNT:-2}
+      LEMN_SQLITE_PATH: /data/lemn_data.db
+      LEMN_POSTGRES_DSN: postgres://${POSTGRES_USER:-lemn}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lemn_kernel}?sslmode=disable
+      LEMN_EXTRACTION_URL: ${LEMN_EXTRACTION_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/chat/completions}
+      LEMN_EXTRACTION_MODEL: ${LEMN_EXTRACTION_MODEL:-qwen2.5-coder}
+      LEMN_EMBEDDING_URL: ${LEMN_EMBEDDING_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/embeddings}
+      LEMN_EMBEDDING_MODEL: ${LEMN_EMBEDDING_MODEL:-bge-m3}
+      LEMN_RETRIEVAL_THRESHOLD: ${LEMN_RETRIEVAL_THRESHOLD:-0.45}
+      LEMN_SUPERSEDE_THRESHOLD: ${LEMN_SUPERSEDE_THRESHOLD:-0.82}
+      LEMN_BACKEND_API_KEY: ${LEMN_BACKEND_API_KEY:-}
+      LEMN_LAYA_TIMEOUT: ${LEMN_LAYA_TIMEOUT:-60s}
+      LEMN_EXTRACTION_TIMEOUT: ${LEMN_EXTRACTION_TIMEOUT:-120s}
+    volumes:
+      - lemndata:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      laya:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  lemndata:
+  hfcache:

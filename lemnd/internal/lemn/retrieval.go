@@ -5,9 +5,21 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
-func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string, limit int) ([]RetrievedMemory, error) {
+// Calibrated for bge-m3: question-vs-statement similarity peaks near 0.55, so
+// the old 0.75 constant matched nothing. Re-measure if you change embedders.
+func retrievalThreshold() float64 {
+	if v := getenv("LEMN_RETRIEVAL_THRESHOLD", ""); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return 0.45
+}
+
+func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string, projectID string, limit int) ([]RetrievedMemory, error) {
 	if limit <= 0 {
 		limit = 5
 	}
@@ -19,24 +31,26 @@ func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string
 
 	embeddingJSON, _ := json.Marshal(queryEmbedding)
 
+	// Reads span the caller's project plus the global scope; writes never do.
 	query := `
-		SELECT id, category, summary, 1 - (embedding <=> $1::vector) as similarity
+		SELECT id, project_id, category, summary, 1 - (embedding <=> $1::vector) as similarity
 		FROM lemn_memories
 		WHERE state = 'AUTHORITATIVE'
-		  AND 1 - (embedding <=> $1::vector) > 0.75
+		  AND project_id IN ($3, $4)
+		  AND 1 - (embedding <=> $1::vector) > $5
 		ORDER BY similarity DESC
 		LIMIT $2;`
 
-	rows, err := db.QueryContext(ctx, query, string(embeddingJSON), limit)
+	rows, err := db.QueryContext(ctx, query, string(embeddingJSON), limit, NormalizeScope(projectID), GlobalScope, retrievalThreshold())
 	if err != nil {
 		return nil, fmt.Errorf("vector similarity query failed: %w", err)
 	}
 	defer rows.Close()
 
-	var memories []RetrievedMemory
+	memories := []RetrievedMemory{}
 	for rows.Next() {
 		var m RetrievedMemory
-		if err := rows.Scan(&m.ID, &m.Category, &m.Summary, &m.Similarity); err == nil {
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.Category, &m.Summary, &m.Similarity); err == nil {
 			memories = append(memories, m)
 		}
 	}

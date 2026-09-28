@@ -95,6 +95,17 @@ func getenvInt(key string, def int) int {
 	return def
 }
 
+// Worker-side calls have no user waiting on them, so these are generous: a
+// timeout here loses the memory entirely after its retries are exhausted.
+func getenvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
 // handleLog durably enqueues the raw payload BEFORE responding. This is
 // the fix for the old "go processTurn(...)" fire-and-forget pattern: if
 // the process dies immediately after this handler returns 202, the turn
@@ -147,7 +158,7 @@ func handleRetrieve(pgDB *sql.DB) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 
-		memories, err := lemn.QueryAuthoritativeMemories(ctx, pgDB, req.Query, req.Limit)
+		memories, err := lemn.QueryAuthoritativeMemories(ctx, pgDB, req.Query, req.ProjectID, req.Limit)
 		if err != nil {
 			log.Printf("[Retrieval Error]: %v", err)
 			w.Header().Set("Content-Type", "application/json")
@@ -248,7 +259,7 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 }
 
 func runZeroShotExtraction(t lemn.TurnPayload) (lemn.ModelExtraction, error) {
-	memoryWorthy, probability, err := decideMemoryWorthiness(t)
+	memoryWorthy, probability, globallyApplicable, err := decideMemoryWorthiness(t)
 	if err != nil {
 		return lemn.ModelExtraction{}, err
 	}
@@ -270,15 +281,24 @@ Respond ONLY with JSON matching this format:
 		t.UserMessage, t.AssistantResponse)
 
 	reqBody, _ := json.Marshal(map[string]any{
-		"model": "qwen2.5-coder",
+		"model": getenv("LEMN_EXTRACTION_MODEL", "qwen2.5-coder"),
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
 		"response_format": map[string]string{"type": "json_object"},
 	})
 
-	client := http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Post("http://localhost:8000/v1/chat/completions", "application/json", bytes.NewBuffer(reqBody))
+	client := http.Client{Timeout: getenvDuration("LEMN_EXTRACTION_TIMEOUT", 120*time.Second)}
+	extractReq, err := http.NewRequest(http.MethodPost, getenv("LEMN_EXTRACTION_URL", "http://localhost:8000/v1/chat/completions"), bytes.NewBuffer(reqBody))
+	if err != nil {
+		return lemn.ModelExtraction{}, fmt.Errorf("failed to build extraction request: %w", err)
+	}
+	extractReq.Header.Set("Content-Type", "application/json")
+	if key := os.Getenv("LEMN_BACKEND_API_KEY"); key != "" {
+		extractReq.Header.Set("Authorization", "Bearer "+key)
+	}
+
+	resp, err := client.Do(extractReq)
 	if err != nil {
 		return lemn.ModelExtraction{}, fmt.Errorf("HTTP request failed: %w", err)
 	}
@@ -311,15 +331,28 @@ Respond ONLY with JSON matching this format:
 		return lemn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
 	}
 
+	// Type "none" is the extraction model's own veto: Laya thought the turn
+	// was worth a look, but there was no durable claim in it to store.
+	if payload.Type == "" || payload.Type == "none" {
+		return lemn.ModelExtraction{
+			MemoryWorthy: false,
+			Type:         "none",
+			Confidence:   payload.Confidence,
+		}, nil
+	}
+
 	return lemn.ModelExtraction{
 		MemoryWorthy: true,
+		GlobalScoped: globallyApplicable,
 		Type:         payload.Type,
 		Summary:      payload.Summary,
 		Confidence:   payload.Confidence,
 	}, nil
 }
 
-func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, error) {
+// Returns memory-worthiness, its probability, and whether the turn is a
+// user-level preference that should be stored in the global scope.
+func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, error) {
 	reqBody, _ := json.Marshal(map[string]string{
 		"user_message":       t.UserMessage,
 		"assistant_response": t.AssistantResponse,
@@ -327,30 +360,37 @@ func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, error) {
 
 	req, err := http.NewRequest(http.MethodPost, layaMemoryURL, bytes.NewBuffer(reqBody))
 	if err != nil {
-		return false, 0, fmt.Errorf("failed to build memory-worthiness request: %w", err)
+		return false, 0, false, fmt.Errorf("failed to build memory-worthiness request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+sharedSecret)
 
-	client := http.Client{Timeout: 5 * time.Second}
+	client := http.Client{Timeout: getenvDuration("LEMN_LAYA_TIMEOUT", 60*time.Second)}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, 0, fmt.Errorf("memory-worthiness request failed: %w", err)
+		return false, 0, false, fmt.Errorf("memory-worthiness request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, 0, fmt.Errorf("memory-worthiness API returned status %d: %s", resp.StatusCode, string(body))
+		return false, 0, false, fmt.Errorf("memory-worthiness API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
-		MemoryWorthy bool    `json:"memory_worthy"`
-		Probability  float64 `json:"probability"`
+		MemoryWorthy       bool    `json:"memory_worthy"`
+		Probability        float64 `json:"probability"`
+		GloballyApplicable bool    `json:"globally_applicable"`
+		GlobalProbability  float64 `json:"global_probability"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false, 0, fmt.Errorf("memory-worthiness decode failed: %w", err)
+		return false, 0, false, fmt.Errorf("memory-worthiness decode failed: %w", err)
 	}
 
-	return result.MemoryWorthy, result.Probability, nil
+	if result.MemoryWorthy {
+		log.Printf("[Gate] turn %s memory_worthy=true (p=%.2f) global=%t (p=%.2f)",
+			t.ID, result.Probability, result.GloballyApplicable, result.GlobalProbability)
+	}
+
+	return result.MemoryWorthy, result.Probability, result.GloballyApplicable, nil
 }

@@ -40,7 +40,7 @@ func PromoteStandardMemory(ctx context.Context, db *sql.DB, mem MemoryNode, tool
 		return 0, fmt.Errorf("evidence check failed: %w", err)
 	}
 
-	candidateMatches, err := findSimilarAuthoritative(ctx, db, mem.Embedding, correctionMatchThreshold)
+	candidateMatches, err := findSimilarAuthoritative(ctx, db, mem.Embedding, supersedeThreshold(), mem.ProjectID)
 	if err != nil {
 		return 0, fmt.Errorf("similarity search failed: %w", err)
 	}
@@ -84,10 +84,10 @@ func SupersedeMemory(ctx context.Context, db *sql.DB, oldID int, newMem MemoryNo
 	embeddingJSON, _ := json.Marshal(newMem.Embedding)
 
 	err = tx.QueryRowContext(ctx, `
-		INSERT INTO lemn_memories (state, confidence, category, summary, rationale, embedding, provenance)
-		VALUES ('AUTHORITATIVE', $1, $2, $3, $4, $5, $6)
+		INSERT INTO lemn_memories (state, project_id, confidence, category, summary, rationale, embedding, provenance)
+		VALUES ('AUTHORITATIVE', $1, $2, $3, $4, $5, $6, $7)
 		RETURNING id;`,
-		newMem.Confidence, newMem.Category, newMem.Summary, newMem.Rationale, string(embeddingJSON), provenanceJSON,
+		NormalizeScope(newMem.ProjectID), newMem.Confidence, newMem.Category, newMem.Summary, newMem.Rationale, string(embeddingJSON), provenanceJSON,
 	).Scan(&newID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to insert new authoritative memory: %w", err)
@@ -119,10 +119,10 @@ func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) 
 	embeddingJSON, _ := json.Marshal(mem.Embedding)
 
 	err := db.QueryRowContext(ctx, `
-		INSERT INTO lemn_memories (state, confidence, category, summary, rationale, embedding, provenance)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO lemn_memories (state, project_id, confidence, category, summary, rationale, embedding, provenance)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id;`,
-		mem.State, mem.Confidence, mem.Category, mem.Summary, mem.Rationale, string(embeddingJSON), provenanceJSON,
+		mem.State, NormalizeScope(mem.ProjectID), mem.Confidence, mem.Category, mem.Summary, mem.Rationale, string(embeddingJSON), provenanceJSON,
 	).Scan(&id)
 	return id, err
 }

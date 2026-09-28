@@ -35,6 +35,7 @@ import laya
 MODEL_REPO = os.environ.get("LAYA_MODEL_REPO", "convaiinnovations/laya-typed-decisions")
 THRESHOLD = float(os.environ.get("LAYA_ROUTING_THRESHOLD", "0.5"))
 MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.5"))
+GLOBAL_THRESHOLD = float(os.environ.get("LAYA_GLOBAL_THRESHOLD", "0.67"))
 
 SHARED_SECRET = os.environ.get("LEMN_SHARED_SECRET")
 if not SHARED_SECRET:
@@ -58,7 +59,9 @@ app = FastAPI(title="LEMN Laya Classifier")
 
 agent = laya.load(MODEL_REPO)
 
-QUESTIONS = {
+# Split per endpoint: agent.predict evaluates every question it is handed, so a
+# combined dict would make each routing call pay for the memory questions too.
+ROUTING_QUESTIONS = {
     "requires_reasoning": {
         "type": "noul",
         "instructions": (
@@ -68,7 +71,10 @@ QUESTIONS = {
             "quick lookup, a simple edit, or a straightforward factual "
             "question that a fast model could answer directly?"
         ),
-    },
+    }
+}
+
+MEMORY_QUESTIONS = {
     "memory_worthy": {
         "type": "noul",
         "instructions": (
@@ -79,7 +85,19 @@ QUESTIONS = {
             "in future conversations as opposed to a transient request, a "
             "routine exchange, or short-lived context?"
         ),
-    }
+    },
+    "globally_applicable": {
+        "type": "noul",
+        # Counterfactual phrasing, chosen by measurement: asking directly whether
+        # something is "about the user" scored project facts *higher* than real
+        # preferences on this checkpoint. Separation here is narrow (~0.04), so
+        # LAYA_GLOBAL_THRESHOLD is deliberately set above the observed midpoint.
+        "instructions": (
+            "Would this statement still be completely true and useful if the "
+            "current project were deleted and the user started an entirely "
+            "unrelated new project from scratch?"
+        ),
+    },
 }
 
 
@@ -102,13 +120,27 @@ class MemoryWorthinessResponse(BaseModel):
     memory_worthy: bool
     probability: float
     threshold: float
+    globally_applicable: bool
+    global_probability: float
+    global_threshold: float
+
+
+def _noul(result: dict, question: str) -> float:
+    """Pull one probability out of Laya's ``{"answers": {...}}`` envelope."""
+    try:
+        return float(result["answers"][question]["noul"])
+    except (KeyError, TypeError) as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"unexpected Laya response shape for {question!r}: {exc}",
+        ) from exc
 
 
 @app.post("/classify", response_model=ClassifyResponse, dependencies=[Depends(require_auth)])
 def classify(req: ClassifyRequest) -> ClassifyResponse:
     state = {"query": req.query}
-    result = agent.predict(state, QUESTIONS)
-    probability = float(result["requires_reasoning"]["noul"])
+    result = agent.predict(state, ROUTING_QUESTIONS)
+    probability = _noul(result, "requires_reasoning")
     return ClassifyResponse(
         requires_reasoning=probability >= THRESHOLD,
         probability=probability,
@@ -121,12 +153,16 @@ def memory_worthiness(req: MemoryWorthinessRequest) -> MemoryWorthinessResponse:
     state = {
         "query": "User: %s\nAssistant: %s" % (req.user_message, req.assistant_response),
     }
-    result = agent.predict(state, QUESTIONS)
-    probability = float(result["memory_worthy"]["noul"])
+    result = agent.predict(state, MEMORY_QUESTIONS)
+    probability = _noul(result, "memory_worthy")
+    global_probability = _noul(result, "globally_applicable")
     return MemoryWorthinessResponse(
         memory_worthy=probability >= MEMORY_THRESHOLD,
         probability=probability,
         threshold=MEMORY_THRESHOLD,
+        globally_applicable=global_probability >= GLOBAL_THRESHOLD,
+        global_probability=global_probability,
+        global_threshold=GLOBAL_THRESHOLD,
     )
 
 
@@ -137,4 +173,5 @@ def healthz():
         "model_repo": MODEL_REPO,
         "routing_threshold": THRESHOLD,
         "memory_threshold": MEMORY_THRESHOLD,
+        "global_threshold": GLOBAL_THRESHOLD,
     }

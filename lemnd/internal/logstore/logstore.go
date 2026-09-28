@@ -3,14 +3,24 @@ package logstore
 import (
 	"database/sql"
 	"fmt"
+	"os"
 
 	_ "modernc.org/sqlite"
 )
 
 const DSN = "file:./lemn_data.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 
+// dsn resolves the SQLite file, allowing LEMN_SQLITE_PATH to relocate it off the
+// working directory (needed when the store lives on a mounted volume).
+func dsn() string {
+	if p := os.Getenv("LEMN_SQLITE_PATH"); p != "" {
+		return "file:" + p + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	}
+	return DSN
+}
+
 func Open() (*sql.DB, error) {
-	db, err := sql.Open("sqlite", DSN)
+	db, err := sql.Open("sqlite", dsn())
 	if err != nil {
 		return nil, err
 	}

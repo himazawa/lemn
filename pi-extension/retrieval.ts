@@ -1,9 +1,7 @@
-export function injectMemoryToUserTail(originalUserMessage: string, retrievedMemories: any[]): string {
-  if (retrievedMemories.length === 0) return originalUserMessage;
-
+export function formatMemoryBlock(retrievedMemories: any[]): string {
   const memoryBlock = retrievedMemories
-    .map(m => `- [${m.category.toUpperCase()} #${m.id}] ${m.summary}`)
+    .map(m => `- [${String(m.category).toUpperCase()} #${m.id}] ${m.summary}`)
     .join("\n");
 
-  return `<retrieved_memory>\n${memoryBlock}\n</retrieved_memory>\n\nUser Query: ${originalUserMessage}`;
+  return `<retrieved_memory>\nThese are previously confirmed facts about this project and user. Treat them as authoritative unless the user contradicts them.\n${memoryBlock}\n</retrieved_memory>`;
 }

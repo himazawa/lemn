@@ -7,6 +7,7 @@ type ToolCallEvidence struct {
 
 type TurnPayload struct {
 	ID                string             `json:"id"`
+	ProjectID         string             `json:"project_id"`
 	UserMessage       string             `json:"user_message"`
 	AssistantResponse string             `json:"assistant_response"`
 	ToolCalls         []ToolCallEvidence `json:"tool_calls"`
@@ -14,6 +15,7 @@ type TurnPayload struct {
 
 type ModelExtraction struct {
 	MemoryWorthy bool    `json:"memory_worthy"`
+	GlobalScoped bool    `json:"global_scoped"` // user-level preference rather than a project fact
 	Type         string  `json:"type"` // "decision", "architecture", "bug_fix", "none"
 	Summary      string  `json:"summary"`
 	Confidence   float64 `json:"confidence"` // 0.0 - 1.0
@@ -22,6 +24,7 @@ type ModelExtraction struct {
 type MemoryNode struct {
 	ID         int                    `json:"id"`
 	State      string                 `json:"state"`
+	ProjectID  string                 `json:"project_id"`
 	Confidence float64                `json:"confidence"`
 	Category   string                 `json:"category"`
 	Summary    string                 `json:"summary"`
@@ -42,12 +45,14 @@ type CorrectionIntent struct {
 }
 
 type RetrievalRequest struct {
-	Query string `json:"query"`
-	Limit int    `json:"limit"`
+	Query     string `json:"query"`
+	ProjectID string `json:"project_id"`
+	Limit     int    `json:"limit"`
 }
 
 type RetrievedMemory struct {
 	ID         int     `json:"id"`
+	ProjectID  string  `json:"project_id"`
 	Category   string  `json:"category"`
 	Summary    string  `json:"summary"`
 	Similarity float64 `json:"similarity"`

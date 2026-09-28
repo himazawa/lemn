@@ -25,14 +25,45 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"lemnd/internal/authmw"
 )
 
+// Content is raw because OpenAI-compatible clients send either a plain string
+// or an array of typed parts; Pi sends the latter.
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role    string          `json:"role"`
+	Content json.RawMessage `json:"content"`
+}
+
+func contentText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		if p.Text == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(p.Text)
+	}
+	return b.String()
 }
 
 type chatRequest struct {
@@ -52,15 +83,38 @@ var (
 	layaEndpoint    = getenv("LEMN_LAYA_URL", "http://localhost:8002/classify")
 	fastModelURL    = getenv("LEMN_FAST_MODEL_URL", "http://localhost:8010/v1/chat/completions")
 	heavyModelURL   = getenv("LEMN_HEAVY_MODEL_URL", "http://localhost:8011/v1/chat/completions")
+	fastModelName   = os.Getenv("LEMN_FAST_MODEL_NAME")
+	heavyModelName  = os.Getenv("LEMN_HEAVY_MODEL_NAME")
+	backendAPIKey   = os.Getenv("LEMN_BACKEND_API_KEY")
 	routerBind      = getenv("LEMN_ROUTER_BIND", "127.0.0.1:8090")
-	classifyTimeout = 2 * time.Second
+	// Laya is single-process and CPU-bound, so a classify can queue behind the
+	// daemon's memory-worthiness call. Too low here silently routes everything
+	// to the heavy model via the fail-open path.
+	classifyTimeout = getenvDuration("LEMN_CLASSIFY_TIMEOUT", 5*time.Second)
 	backendTimeout  = 5 * time.Minute // generous — this covers full generation, not just connect
 	sharedSecret    string
 )
 
+// backend is the chosen destination. model is non-empty for servers that host
+// several models behind a single URL (oMLX), where the request body — not the
+// address — selects which one runs.
+type backend struct {
+	url   string
+	model string
+}
+
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 	return def
 }
@@ -100,22 +154,33 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	lastUserMsg := ""
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
-			lastUserMsg = req.Messages[i].Content
+			lastUserMsg = contentText(req.Messages[i].Content)
 			break
 		}
 	}
 
-	backend := chooseBackend(lastUserMsg)
+	chosen := chooseBackend(lastUserMsg)
+	if chosen.model != "" {
+		rewritten, err := withModel(bodyBytes, chosen.model)
+		if err != nil {
+			log.Printf("[Router] failed to rewrite model field: %v — forwarding original body", err)
+		} else {
+			bodyBytes = rewritten
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
 	defer cancel()
 
-	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, backend, bytes.NewReader(bodyBytes))
+	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, chosen.url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	proxyReq.Header.Set("Content-Type", "application/json")
+	if backendAPIKey != "" {
+		proxyReq.Header.Set("Authorization", "Bearer "+backendAPIKey)
+	}
 
 	resp, err := http.DefaultClient.Do(proxyReq)
 	if err != nil {
@@ -151,9 +216,27 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func chooseBackend(userMessage string) string {
+// withModel replaces the model field while preserving every other key the
+// client sent, including ones this proxy does not model.
+func withModel(body []byte, model string) ([]byte, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(model)
+	if err != nil {
+		return nil, err
+	}
+	raw["model"] = encoded
+	return json.Marshal(raw)
+}
+
+func chooseBackend(userMessage string) backend {
+	fast := backend{url: fastModelURL, model: fastModelName}
+	heavy := backend{url: heavyModelURL, model: heavyModelName}
+
 	if userMessage == "" {
-		return heavyModelURL
+		return heavy
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), classifyTimeout)
@@ -163,7 +246,7 @@ func chooseBackend(userMessage string) string {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, layaEndpoint, bytes.NewReader(reqBody))
 	if err != nil {
 		log.Printf("[Router] failed to build classify request: %v — failing open to heavy model", err)
-		return heavyModelURL
+		return heavy
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+sharedSecret)
@@ -171,20 +254,20 @@ func chooseBackend(userMessage string) string {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("[Router] Laya classify call failed: %v — failing open to heavy model", err)
-		return heavyModelURL
+		return heavy
 	}
 	defer resp.Body.Close()
 
 	var result classifyResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		log.Printf("[Router] failed to decode Laya response: %v — failing open to heavy model", err)
-		return heavyModelURL
+		return heavy
 	}
 
 	if result.RequiresReasoning {
 		log.Printf("[Router] requires_reasoning=true (p=%.2f) -> heavy model", result.Probability)
-		return heavyModelURL
+		return heavy
 	}
 	log.Printf("[Router] requires_reasoning=false (p=%.2f) -> fast model", result.Probability)
-	return fastModelURL
+	return fast
 }
