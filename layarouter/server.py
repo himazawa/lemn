@@ -33,7 +33,7 @@ from pydantic import BaseModel
 import laya
 
 MODEL_REPO = os.environ.get("LAYA_MODEL_REPO", "convaiinnovations/laya-typed-decisions")
-THRESHOLD = float(os.environ.get("LAYA_ROUTING_THRESHOLD", "0.5"))
+THRESHOLD = float(os.environ.get("LAYA_ROUTING_THRESHOLD", "0.38"))
 MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.5"))
 GLOBAL_THRESHOLD = float(os.environ.get("LAYA_GLOBAL_THRESHOLD", "0.67"))
 
@@ -64,12 +64,15 @@ agent = laya.load(MODEL_REPO)
 ROUTING_QUESTIONS = {
     "requires_reasoning": {
         "type": "noul",
+        # Chosen by measurement over a labelled set. Asking about "deep multi-step
+        # reasoning" tracked how verbosely a request was phrased, not how hard it
+        # was, and left easy and hard queries overlapping. Asking about codebase
+        # breadth separates them, and matches what actually predicts failure on a
+        # small model: tasks that span many files.
         "instructions": (
-            "Does answering this query require deep multi-step reasoning, "
-            "non-trivial architectural or algorithmic decisions, or careful "
-            "analysis across multiple considerations as opposed to a "
-            "quick lookup, a simple edit, or a straightforward factual "
-            "question that a fast model could answer directly?"
+            "Does this task require reading and reasoning about many parts of a "
+            "codebase before answering, as opposed to a single lookup or a "
+            "localized edit to one spot?"
         ),
     }
 }

@@ -25,6 +25,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,6 +102,8 @@ var (
 type backend struct {
 	url   string
 	model string
+	label string  // "fast" or "heavy", surfaced to the client
+	prob  float64 // negative when the classifier did not answer
 }
 
 func getenv(key, def string) string {
@@ -194,6 +197,14 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			w.Header().Add(k, v)
 		}
 	}
+	// Lets clients show which model actually answered; the Pi extension reads these.
+	w.Header().Set("X-Lemn-Route", chosen.label)
+	if chosen.model != "" {
+		w.Header().Set("X-Lemn-Model", chosen.model)
+	}
+	if chosen.prob >= 0 {
+		w.Header().Set("X-Lemn-Probability", strconv.FormatFloat(chosen.prob, 'f', 2, 64))
+	}
 	w.WriteHeader(resp.StatusCode)
 
 	// Flush after every write so streamed (SSE) completions reach Pi
@@ -232,8 +243,8 @@ func withModel(body []byte, model string) ([]byte, error) {
 }
 
 func chooseBackend(userMessage string) backend {
-	fast := backend{url: fastModelURL, model: fastModelName}
-	heavy := backend{url: heavyModelURL, model: heavyModelName}
+	fast := backend{url: fastModelURL, model: fastModelName, label: "fast", prob: -1}
+	heavy := backend{url: heavyModelURL, model: heavyModelName, label: "heavy", prob: -1}
 
 	if userMessage == "" {
 		return heavy
@@ -266,8 +277,10 @@ func chooseBackend(userMessage string) backend {
 
 	if result.RequiresReasoning {
 		log.Printf("[Router] requires_reasoning=true (p=%.2f) -> heavy model", result.Probability)
+		heavy.prob = result.Probability
 		return heavy
 	}
 	log.Printf("[Router] requires_reasoning=false (p=%.2f) -> fast model", result.Probability)
+	fast.prob = result.Probability
 	return fast
 }

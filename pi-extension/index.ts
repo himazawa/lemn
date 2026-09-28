@@ -55,6 +55,22 @@ export default function lemnExtension(pi: ExtensionAPI) {
     );
   }
 
+  // Surface which backend the router picked, in Pi's footer. The router stamps
+  // this onto the response; header names arrive lower-cased.
+  pi.on("after_provider_response", async (event, ctx) => {
+    const h = event.headers ?? {};
+    const route = h["x-lemn-route"] ?? h["X-Lemn-Route"];
+    if (!route) return;
+
+    const prob = h["x-lemn-probability"] ?? h["X-Lemn-Probability"];
+    const model = h["x-lemn-model"] ?? h["X-Lemn-Model"];
+
+    const parts = [route === "heavy" ? "heavy" : "fast"];
+    if (model) parts.push(model);
+    if (prob) parts.push(`p=${prob}`);
+    ctx.ui.setStatus("lemn", parts.join(" · "));
+  });
+
   // READ PATH: fetch memories before generation and inject them as a separate
   // message — Pi builds the prompt itself, so the user's text is not editable.
   pi.on("before_agent_start", async (event) => {
