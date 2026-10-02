@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from urllib.parse import quote
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -79,9 +81,9 @@ def request_json(url: str, payload: dict[str, Any], headers: dict[str, str], tim
         raise RuntimeError(f"POST {url} failed: {exc.reason}") from exc
 
 
-def fetch_memories(args: argparse.Namespace, query: str, project_id: str, headers: dict[str, str]) -> list[dict[str, Any]]:
+def fetch_memories(args: argparse.Namespace, daemon_url: str, query: str, project_id: str, headers: dict[str, str]) -> list[dict[str, Any]]:
     payload = {"query": query, "project_id": project_id, "limit": args.retrieval_limit}
-    result = request_json(args.daemon_url.rstrip("/") + "/retrieve", payload, headers, args.timeout)
+    result = request_json(daemon_url.rstrip("/") + "/retrieve", payload, headers, args.timeout)
     if not isinstance(result, list):
         raise RuntimeError("LEMN /retrieve response was not a JSON array")
     return result
@@ -91,10 +93,11 @@ def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def run_psql(sql: str) -> list[str]:
+def run_psql(sql: str, database: str | None = None) -> list[str]:
+    database_arg = database or os.environ.get("POSTGRES_DB", "lemn_kernel")
     command = [
         "docker", "compose", "exec", "-T", "postgres", "sh", "-c",
-        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
+        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$1"', "sh", database_arg,
     ]
     try:
         result = subprocess.run(command, cwd=REPO_DIR, input=sql, text=True, capture_output=True, check=False)
@@ -105,7 +108,73 @@ def run_psql(sql: str) -> list[str]:
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
-def create_isolated_fixtures(args: argparse.Namespace, run_id: str, embedding_headers: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
+def create_isolated_database(run_id: str) -> tuple[str, str]:
+    user = os.environ.get("POSTGRES_USER", "lemn")
+    password = os.environ.get("POSTGRES_PASSWORD", "")
+    if not password:
+        raise ValueError("POSTGRES_PASSWORD must be loaded from .env for isolated retrieval benchmarking")
+    database = f"lemn_bench_{run_id}"
+    run_psql(f'CREATE DATABASE "{database}";')
+    try:
+        schema = (REPO_DIR / "schema.sql").read_text(encoding="utf-8")
+        run_psql(schema, database=database)
+    except Exception:
+        drop_isolated_database(database)
+        raise
+    dsn = f"postgres://{quote(user, safe='')}:{quote(password, safe='')}@postgres:5432/{database}?sslmode=disable"
+    print(f"Created isolated retrieval benchmark database {database}; production globals are not visible.")
+    return database, dsn
+
+
+def drop_isolated_database(database: str) -> None:
+    run_psql(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE);')
+    remaining = run_psql(
+        f"SELECT count(*) FROM pg_database WHERE datname = {sql_literal(database)};",
+    )
+    if remaining != ["0"]:
+        raise RuntimeError(f"retrieval benchmark database {database} still exists")
+
+
+def start_isolated_daemon(run_id: str, startup_timeout: int, postgres_dsn: str) -> tuple[str, str]:
+    sqlite_path = f"/tmp/lemn-retrieval-bench-{run_id}.db"
+    command = [
+        "docker", "compose", "run", "--detach", "--rm", "--build", "--no-deps",
+        "--publish", "127.0.0.1::8080",
+        "--env", f"LEMN_SQLITE_PATH={sqlite_path}",
+        "--env", f"LEMN_POSTGRES_DSN={postgres_dsn}",
+        "daemon",
+    ]
+    result = subprocess.run(command, cwd=REPO_DIR, text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise RuntimeError(f"could not start isolated daemon: {result.stderr.strip()}")
+    container_id = result.stdout.strip().splitlines()[-1]
+    if not re.fullmatch(r"[0-9a-f]{12,64}", container_id):
+        raise RuntimeError(f"unexpected docker compose run output: {result.stdout.strip()}")
+    port_result = subprocess.run(["docker", "port", container_id, "8080/tcp"], text=True, capture_output=True, check=False)
+    if port_result.returncode:
+        subprocess.run(["docker", "stop", container_id], capture_output=True, check=False)
+        raise RuntimeError(f"could not discover isolated daemon port: {port_result.stderr.strip()}")
+    port = port_result.stdout.strip().splitlines()[0].rsplit(":", 1)[-1]
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + startup_timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(base_url + "/healthz", timeout=2):
+                print(f"Started isolated retrieval daemon on {base_url}.")
+                return container_id, base_url
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.5)
+    subprocess.run(["docker", "stop", container_id], capture_output=True, check=False)
+    raise TimeoutError("isolated retrieval daemon did not become healthy before timeout")
+
+
+def stop_isolated_daemon(container_id: str) -> None:
+    result = subprocess.run(["docker", "stop", container_id], text=True, capture_output=True, check=False)
+    if result.returncode and "No such container" not in result.stderr:
+        raise RuntimeError(f"could not stop isolated daemon: {result.stderr.strip()}")
+
+
+def create_isolated_fixtures(args: argparse.Namespace, run_id: str, embedding_headers: dict[str, str], database: str) -> tuple[dict[str, str], dict[str, str]]:
     corpus = json.loads(Path(args.corpus).read_text(encoding="utf-8"))
     projects = corpus.get("projects", {})
     if not projects:
@@ -152,15 +221,15 @@ def create_isolated_fixtures(args: argparse.Namespace, run_id: str, embedding_he
             )
             expected_inserts += 1
     statements.append("COMMIT;")
-    ids = run_psql("\n".join(statements))
+    ids = run_psql("\n".join(statements), database=database)
     if len(ids) != expected_inserts or any(not value.isdigit() for value in ids):
-        cleanup_isolated_fixtures(run_id)
+        cleanup_isolated_fixtures(run_id, database)
         raise RuntimeError(f"expected {expected_inserts} seeded memory IDs, got {ids}")
     print(f"Created disposable scopes {', '.join(scopes.values())}; seeded {expected_inserts} synthetic memory facts.")
     return scopes, contexts
 
 
-def apply_learning_updates(args: argparse.Namespace, run_id: str, scopes: dict[str, str], embedding_headers: dict[str, str]) -> None:
+def apply_learning_updates(args: argparse.Namespace, run_id: str, scopes: dict[str, str], embedding_headers: dict[str, str], database: str) -> None:
     corpus = json.loads(Path(args.corpus).read_text(encoding="utf-8"))
     statements = ["BEGIN;"]
     update_count = 0
@@ -206,22 +275,23 @@ def apply_learning_updates(args: argparse.Namespace, run_id: str, scopes: dict[s
     statements.append("COMMIT;")
     if not update_count:
         return
-    updated = run_psql("\n".join(statements))
+    updated = run_psql("\n".join(statements), database=database)
     if len(updated) != update_count or any(":" not in value for value in updated):
         raise RuntimeError(f"expected {update_count} applied learning updates, got {updated}")
     print(f"Applied {update_count} simulated learning update(s); AGENTS.md fixtures were not modified.")
 
 
-def cleanup_isolated_fixtures(run_id: str) -> None:
+def cleanup_isolated_fixtures(run_id: str, database: str) -> None:
     marker = sql_literal(run_id)
     run_psql(
         "BEGIN;\n"
         "DELETE FROM lemn_edges WHERE source_id IN (SELECT id FROM lemn_memories WHERE provenance->>'benchmark_run' = " + marker + ") "
         "OR target_id IN (SELECT id FROM lemn_memories WHERE provenance->>'benchmark_run' = " + marker + ");\n"
         "DELETE FROM lemn_memories WHERE provenance->>'benchmark_run' = " + marker + ";\n"
-        "COMMIT;"
+        "COMMIT;",
+        database=database,
     )
-    remaining = run_psql("SELECT count(*) FROM lemn_memories WHERE provenance->>'benchmark_run' = " + marker + ";")
+    remaining = run_psql("SELECT count(*) FROM lemn_memories WHERE provenance->>'benchmark_run' = " + marker + ";", database=database)
     if remaining != ["0"]:
         raise RuntimeError(f"benchmark cleanup left {remaining} memory rows for run {run_id}")
 
@@ -315,16 +385,23 @@ def run_benchmark(args: argparse.Namespace) -> None:
         embedding_headers = {"Content-Type": "application/json"}
 
     fixture_run_id = uuid.uuid4().hex[:12]
-    scopes, project_contexts = create_isolated_fixtures(args, fixture_run_id, embedding_headers)
-
     arms = list(ARMS)
     rng = random.Random(args.seed)
+    database = ""
+    container_id = ""
+    scopes: dict[str, str] = {}
+    fixtures_created = False
     try:
+        database, postgres_dsn = create_isolated_database(fixture_run_id)
+        container_id, daemon_url = start_isolated_daemon(fixture_run_id, args.startup_timeout, postgres_dsn)
+        scopes, project_contexts = create_isolated_fixtures(args, fixture_run_id, embedding_headers, database)
+        fixtures_created = True
+
         learning_applied = False
         for phase in ("before_learning", "after_learning"):
             phase_tasks = [task for task in tasks if task["phase"] == phase]
             if phase == "after_learning" and phase_tasks and not learning_applied:
-                apply_learning_updates(args, fixture_run_id, scopes, embedding_headers)
+                apply_learning_updates(args, fixture_run_id, scopes, embedding_headers, database)
                 learning_applied = True
             task_runs = [(task, repeat) for repeat in range(args.repeats) for task in phase_tasks]
             rng.shuffle(task_runs)
@@ -341,7 +418,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
                         if arm == "agents":
                             context = "<project_guidance>\n" + project_contexts[project_key] + "\n</project_guidance>"
                         elif arm == "lemn":
-                            memories = fetch_memories(args, str(task["query"]), project_id, retrieval_headers)
+                            memories = fetch_memories(args, daemon_url, str(task["query"]), project_id, retrieval_headers)
                             context = format_lemn_context(memories)
                         else:
                             context = ""
@@ -382,8 +459,25 @@ def run_benchmark(args: argparse.Namespace) -> None:
                         key_file.write(json.dumps(key_row, ensure_ascii=False) + "\n")
                         print(f"{response_id}: completed {len(result_row['answer'])} chars" if not error else f"{response_id}: ERROR {error}")
     finally:
-        cleanup_isolated_fixtures(fixture_run_id)
-        print(f"Removed disposable benchmark scopes for run {fixture_run_id}.")
+        cleanup_error = None
+        if container_id:
+            try:
+                stop_isolated_daemon(container_id)
+            except Exception as exc:
+                cleanup_error = exc
+        if database:
+            if fixtures_created:
+                try:
+                    cleanup_isolated_fixtures(fixture_run_id, database)
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+            try:
+                drop_isolated_database(database)
+                print(f"Dropped isolated retrieval benchmark database {database}.")
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+        if cleanup_error:
+            raise cleanup_error
 
     with score_path.open("w", newline="", encoding="utf-8") as score_file:
         writer = csv.writer(score_file)
@@ -465,6 +559,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--completions-url", default="http://localhost:9001/v1/chat/completions", help="direct fixed-model OpenAI-compatible endpoint; avoid the LEMN router")
     parser.add_argument("--model", required=False, help="model ID accepted by completions endpoint")
     parser.add_argument("--daemon-url", default="http://localhost:8080", help="LEMN daemon base URL")
+    parser.add_argument("--startup-timeout", type=int, default=60, help="seconds to wait for the isolated daemon")
     parser.add_argument("--embeddings-url", default=os.environ.get("LEMN_EMBEDDING_URL", "http://localhost:9001/v1/embeddings"))
     parser.add_argument("--embedding-model", default=os.environ.get("LEMN_EMBEDDING_MODEL", "bge-m3-mlx-fp16"))
     parser.add_argument("--project-id", default=os.environ.get("LEMN_PROJECT_ID", REPO_DIR.name), help="default project scope; individual tasks may override this")
@@ -479,8 +574,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--validate-only", action="store_true", help="validate task/config files without making network calls")
     parser.add_argument("--report", help="summarize completed scores in an output directory")
     args = parser.parse_args()
-    if args.repeats < 1 or args.retrieval_limit < 1 or args.max_tokens < 1:
-        parser.error("repeats, retrieval-limit, and max-tokens must be positive")
+    if args.repeats < 1 or args.retrieval_limit < 1 or args.max_tokens < 1 or args.startup_timeout < 1:
+        parser.error("repeats, retrieval-limit, max-tokens, and startup-timeout must be positive")
     if not args.report and not args.validate_only and not args.model:
         parser.error("--model is required when collecting responses")
     return args

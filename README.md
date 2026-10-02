@@ -760,15 +760,17 @@ Fine-tune the checkpoint on that data with your own pipeline, then point
 
 ## End-to-end Memory Benchmark
 
-`scripts/memory_bench.py` creates a fresh, uniquely named project scope for each
-synthetic project in `scripts/memory_bench_corpus.json`, embeds and inserts its
-initial fixture memories, then compares no memory, that project's fixed
-`AGENTS.md`, and real LEMN `/retrieve` results. It first asks baseline questions,
-then simulates learning an updated alpha retry limit by marking the old memory
-`SUPERSEDED` and inserting the new `AUTHORITATIVE` value. It asks the same
-question again after the update. Alpha's `AGENTS.md` remains at the original
-value for both phases; beta is an unchanged control project. It never reads or
-writes the existing `limn` project scope.
+`scripts/memory_bench.py` creates a scratch Postgres database from `schema.sql`
+and starts a one-off daemon pointed at it. It creates a fresh, uniquely named
+project scope for each synthetic project in `scripts/memory_bench_corpus.json`,
+embeds and inserts initial fixture memories, then compares no memory, that
+project's fixed `AGENTS.md`, and real `/retrieve` results from the isolated
+daemon. It first asks baseline questions, then simulates learning an updated
+alpha retry limit by marking the old memory `SUPERSEDED` and inserting the new
+`AUTHORITATIVE` value. It asks the same question again after the update. Alpha's
+`AGENTS.md` remains at the original value for both phases; beta is an unchanged
+control project. Production project and global memories are neither read nor
+modified.
 
 The corpus is deterministic retrieval test data inserted directly as memory
 rows. The staged update exercises LEMN's persisted state transition and retrieval
@@ -814,29 +816,36 @@ below exercises that separately. Per-project AGENTS fixtures are real files unde
   python3 scripts/memory_bench.py --report /tmp/lemn-memory-bench
   ```
 
-The benchmark deletes its fixture rows on normal completion or handled errors.
-A forced process kill or machine shutdown can bypass cleanup; leftover rows
-remain isolated under `lemn-bench-<run-id>-<project-key>` and cannot affect
-ordinary projects. Check `condition-key.jsonl` for the run ID and remove those
-fixture rows manually if needed. Check daemon logs when a retrieval result is
-empty, since embedding failures are currently returned as an empty array. This
-benchmark does not measure tool-using coding tasks or extraction quality.
+The benchmark stops its one-off daemon and drops the entire scratch database on
+normal completion or handled errors. A forced process kill or machine shutdown
+can bypass cleanup; leftover databases are named `lemn_bench_<run-id>` and do
+not affect production. Check `condition-key.jsonl` for the run ID and drop only
+that scratch database if needed. Check the isolated daemon logs when a retrieval
+result is empty, since embedding failures are currently returned as an empty
+array. This benchmark does not measure tool-using coding tasks or extraction
+quality.
 
-### Isolated staged-learning run
+### Latest Three-Arm Run
 
-On 2026-10-02, one full pass scored 8 tasks across the three arms. LEMN and
-AGENTS each met all 8 rubrics; no memory met 3/8. In the staged alpha update,
-both arms answered 2 before the update, then LEMN answered 4 while the unchanged
-AGENTS fixture continued to answer 2. The beta control stayed at `us-east-2`,
-and both memory arms abstained on the cross-project questions. Mean prompt usage
-was 256 tokens for LEMN and 210 for AGENTS; mean response time was 5.3s and 5.0s
-respectively in this run.
+On 2026-10-03, the full 8-task comparison ran against a scratch Postgres database
+and isolated daemon, with Qwen 3.8 fixed across all arms. Accuracy against the
+arm-specific rubrics was **LEMN 8/8, AGENTS 8/8, no memory 3/8**. Mean prompt
+usage was 254 tokens for LEMN, 210 for AGENTS, and 211 for no memory; mean
+response times were 5.6s, 5.1s, and 7.2s respectively. LEMN returned memories on
+all 8 tasks, including below-threshold background memories for the unknown
+preference query; the model still abstained correctly.
 
-This was one pass over synthetic facts, and the state update was applied by the
-benchmark fixture rather than learned from a conversation. It demonstrates that
-retrieval reflects a stored update while the static file stays unchanged; it is
-not evidence that the extractor will discover, validate, and promote real
-updates. Repeat with more varied facts and wording before drawing conclusions.
+On the staged alpha update, both memory arms answered 2 before the update. After
+the fixture changed LEMN's current value to 4, LEMN answered 4 while static
+AGENTS remained at 2; the benchmark rubric intentionally checks each arm against
+its available context. Thus the run shows LEMN tracks a stored update while the
+file stays fixed, not that AGENTS knew the new current value. Beta stayed at
+`us-east-2`, and all three arms abstained on the two cross-project questions.
+
+This is one pass over synthetic facts, and the update was applied by the fixture
+rather than learned from a conversation. It tests retrieval/injection and scope
+isolation, not the extractor's ability to discover and save updates. Results are
+diagnostic, not evidence of statistical superiority.
 
 ### Write-path evaluation
 
