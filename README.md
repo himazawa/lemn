@@ -791,11 +791,12 @@ project scope for each synthetic project in `scripts/memory_bench_corpus.json`,
 embeds and inserts initial fixture memories, then compares no memory, that
 project's fixed `AGENTS.md`, and real `/retrieve` results from the isolated
 daemon. It first asks baseline questions, then simulates learning an updated
-alpha retry limit by marking the old memory `SUPERSEDED` and inserting the new
-`AUTHORITATIVE` value. It asks the same question again after the update. Alpha's
-`AGENTS.md` remains at the original value for both phases; beta is an unchanged
-control project. Production project and global memories are neither read nor
-modified.
+daemon. Session names and order come from the corpus `session_order`; scheduled
+updates are applied between sessions by marking the old memory `SUPERSEDED` and
+inserting a new `AUTHORITATIVE` value. The current replay has three sessions and
+two sequential alpha retry-limit changes (2 to 4 to 5). Alpha's `AGENTS.md`
+remains static at 2; beta is an unchanged control project. Production project
+and global memories are neither read nor modified.
 
 The corpus is deterministic retrieval test data inserted directly as memory
 rows. The staged update exercises LEMN's persisted state transition and retrieval
@@ -805,9 +806,9 @@ below exercises that separately. Per-project AGENTS fixtures are real files unde
 `scripts/memory_bench_projects/`; the harness reads them and never edits them.
 
 1. Review `scripts/memory_bench_tasks.jsonl`, `scripts/memory_bench_corpus.json`,
-   and the two fixture `AGENTS.md` files. Keep task rubrics fixed before seeing
-   answers. Tasks use `phase` (`before_learning` or `after_learning`) and
-   `project_key` to select the baseline/update point and isolated project.
+   and the fixture `AGENTS.md` files. Keep task rubrics fixed before seeing
+   answers. Tasks use a session name in `phase` and a `project_key`; the corpus
+   defines session order and each project's updates after a named session.
 2. Ensure Docker Compose Postgres, the daemon, the embedding endpoint, and the
   direct model endpoint are running. Use the direct model endpoint, not the
   LEMN router, to hold the model constant.
@@ -819,10 +820,10 @@ below exercises that separately. Per-project AGENTS fixtures are real files unde
   python3 scripts/memory_bench.py --validate-only
   ```
 
-4. Run randomized paired queries within each phase. Baseline tasks run first;
-  then the scripted alpha update occurs; post-learning tasks run afterward.
-  Each run prints its temporary project IDs, inserts only rows stamped with
-  that run's unique marker, and deletes those rows in a `finally` cleanup:
+4. Run randomized paired queries within each session. Sessions execute in the
+  corpus order, with scheduled updates applied between them. Each run prints
+  its temporary project IDs, inserts only rows stamped with that run's unique
+  marker, and deletes those rows in a `finally` cleanup:
 
   ```bash
   python3 scripts/memory_bench.py --model 4-bit \
@@ -831,8 +832,8 @@ below exercises that separately. Per-project AGENTS fixtures are real files unde
     --out /tmp/lemn-memory-bench --repeats 2
   ```
 
-    To focus just on the before/after behavior and beta control, pass
-    `--task-ids alpha-retry-before,alpha-retry-after,beta-region-before,beta-region-after`.
+    To focus on the two consecutive changes and beta control, pass
+    `--task-ids alpha-retry-session-1,alpha-retry-session-2,alpha-retry-session-3,beta-region-session-1,beta-region-session-2`.
 5. Score `blind-results.jsonl` before opening `condition-key.jsonl`. Use each
   task ID and rubric to fill `accuracy_0_or_1`, `factuality_0_to_2`,
   `usefulness_0_to_2`, and notes in `blind-scores.csv`. Then report:
@@ -852,25 +853,23 @@ quality.
 
 ### Latest Three-Arm Run
 
-On 2026-10-03, the full 8-task comparison ran against a scratch Postgres database
-and isolated daemon, with Qwen 3.8 fixed across all arms. Accuracy against the
-arm-specific rubrics was **LEMN 8/8, AGENTS 8/8, no memory 3/8**. Mean prompt
-usage was 254 tokens for LEMN, 210 for AGENTS, and 211 for no memory; mean
-response times were 5.6s, 5.1s, and 7.2s respectively. LEMN returned memories on
-all 8 tasks, including below-threshold background memories for the unknown
-preference query; the model still abstained correctly.
+On 2026-10-03, a three-session replay ran 9 tasks once per arm against a scratch
+Postgres database and isolated daemon, with Qwen 3.8 fixed across all arms.
+Against arm-specific expectations, each condition scored **9/9**. LEMN tracked
+the alpha retry limit through 2, 4, and 5; static `AGENTS.md` remained at 2;
+the no-memory arm abstained on facts it was not given. The unrelated alpha
+region and beta control stayed correct, and the cross-project and unknown-fact
+questions were answered with appropriate abstentions. Mean prompt usage was 241
+tokens for LEMN, 196 for AGENTS, and 210 for no memory; mean response times were
+4.8s, 4.4s, and 6.9s respectively. LEMN returned context on all 9 tasks.
 
-On the staged alpha update, both memory arms answered 2 before the update. After
-the fixture changed LEMN's current value to 4, LEMN answered 4 while static
-AGENTS remained at 2; the benchmark rubric intentionally checks each arm against
-its available context. Thus the run shows LEMN tracks a stored update while the
-file stays fixed, not that AGENTS knew the new current value. Beta stayed at
-`us-east-2`, and all three arms abstained on the two cross-project questions.
-
-This is one pass over synthetic facts, and the update was applied by the fixture
-rather than learned from a conversation. It tests retrieval/injection and scope
-isolation, not the extractor's ability to discover and save updates. Results are
-diagnostic, not evidence of statistical superiority.
+This is one pass over synthetic facts, and both updates were applied by the
+fixture rather than learned from conversations. It tests sequential retrieval,
+supersession, and scope isolation, not the extractor's ability to discover and
+save updates. The no-memory arm is expected to abstain on every supplied fact,
+so 9/9 means it followed that arm's rubric, not that it knew the answers.
+Results are diagnostic, not evidence of statistical superiority; repeated and
+more varied chronological traces are still needed.
 
 ### Write-path evaluation
 

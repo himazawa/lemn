@@ -64,8 +64,31 @@ def validate_tasks(tasks: list[dict[str, Any]]) -> None:
             raise ValueError(f"task {task_id}: expected and rubric are required for scoring")
         if not str(task.get("project_key", "")).strip():
             raise ValueError(f"task {task_id}: project_key is required for isolated fixtures")
-        if task.get("phase") not in {"before_learning", "after_learning"}:
-            raise ValueError(f"task {task_id}: phase must be before_learning or after_learning")
+        if not str(task.get("phase", "")).strip():
+            raise ValueError(f"task {task_id}: phase is required")
+
+
+def validate_session_order(corpus: dict[str, Any]) -> list[str]:
+    order = corpus.get("session_order")
+    if not isinstance(order, list) or not order or any(not isinstance(item, str) or not item.strip() for item in order):
+        raise ValueError("corpus session_order must be a non-empty list of session names")
+    if len(set(order)) != len(order):
+        raise ValueError("corpus session_order contains duplicate session names")
+    update_sessions = set(order[:-1])
+    for project_key, project in corpus.get("projects", {}).items():
+        updates_after = project.get("updates_after", {})
+        if not isinstance(updates_after, dict):
+            raise ValueError(f"project {project_key}: updates_after must map sessions to update lists")
+        unknown = set(updates_after) - update_sessions
+        if unknown:
+            raise ValueError(f"project {project_key}: updates must follow a non-final session, got {', '.join(sorted(unknown))}")
+        for session, updates in updates_after.items():
+            if not isinstance(updates, list):
+                raise ValueError(f"project {project_key}: updates_after[{session}] must be a list")
+            for update in updates:
+                if not str(update.get("target_summary", "")).strip() or not str(update.get("summary", "")).strip():
+                    raise ValueError(f"project {project_key}: update after {session} needs target_summary and summary")
+    return order
 
 
 def request_json(url: str, payload: dict[str, Any], headers: dict[str, str], timeout: int) -> Any:
@@ -229,12 +252,12 @@ def create_isolated_fixtures(args: argparse.Namespace, run_id: str, embedding_he
     return scopes, contexts
 
 
-def apply_learning_updates(args: argparse.Namespace, run_id: str, scopes: dict[str, str], embedding_headers: dict[str, str], database: str) -> None:
+def apply_learning_updates(args: argparse.Namespace, run_id: str, after_phase: str, scopes: dict[str, str], embedding_headers: dict[str, str], database: str) -> None:
     corpus = json.loads(Path(args.corpus).read_text(encoding="utf-8"))
     statements = ["BEGIN;"]
     update_count = 0
     for key, project in corpus["projects"].items():
-        for update in project.get("updates", []):
+        for update in project.get("updates_after", {}).get(after_phase, []):
             target_summary = str(update.get("target_summary", "")).strip()
             new_summary = str(update.get("summary", "")).strip()
             if not target_summary or not new_summary:
@@ -278,7 +301,7 @@ def apply_learning_updates(args: argparse.Namespace, run_id: str, scopes: dict[s
     updated = run_psql("\n".join(statements), database=database)
     if len(updated) != update_count or any(":" not in value for value in updated):
         raise RuntimeError(f"expected {update_count} applied learning updates, got {updated}")
-    print(f"Applied {update_count} simulated learning update(s); AGENTS.md fixtures were not modified.")
+    print(f"Applied {update_count} simulated learning update(s) after {after_phase}; AGENTS.md fixtures were not modified.")
 
 
 def cleanup_isolated_fixtures(run_id: str, database: str) -> None:
@@ -358,8 +381,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
     fixture_projects = corpus.get("projects", {})
     if not fixture_projects:
         raise ValueError("fixture corpus must define projects")
+    session_order = validate_session_order(corpus)
     if any(task["project_key"] not in fixture_projects for task in tasks):
         raise ValueError("every task project_key must be defined in the fixture corpus")
+    unknown_phases = {str(task["phase"]) for task in tasks} - set(session_order)
+    if unknown_phases:
+        raise ValueError(f"tasks use phases absent from corpus session_order: {', '.join(sorted(unknown_phases))}")
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "blind-results.jsonl"
@@ -368,8 +395,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
 
     if args.validate_only:
         fixture_count = sum(len(project.get("memories", [])) for project in fixture_projects.values())
-        update_count = sum(len(project.get("updates", [])) for project in fixture_projects.values())
-        print(f"Validated {len(tasks)} tasks; {fixture_count} initial facts and {update_count} learning updates would be applied in disposable scopes; {len(tasks) * len(ARMS) * args.repeats} responses would be collected.")
+        update_count = sum(
+            len(updates)
+            for project in fixture_projects.values()
+            for updates in project.get("updates_after", {}).values()
+        )
+        print(f"Validated {len(tasks)} tasks across {len(session_order)} sessions ({', '.join(session_order)}); {fixture_count} initial facts and {update_count} scheduled updates would be applied in disposable scopes; {len(tasks) * len(ARMS) * args.repeats} responses would be collected.")
         return
 
     shared_secret = os.environ.get(args.lemn_secret_env, "")
@@ -397,15 +428,13 @@ def run_benchmark(args: argparse.Namespace) -> None:
         scopes, project_contexts = create_isolated_fixtures(args, fixture_run_id, embedding_headers, database)
         fixtures_created = True
 
-        learning_applied = False
-        for phase in ("before_learning", "after_learning"):
+        for phase_index, phase in enumerate(session_order):
+            if phase_index > 0:
+                apply_learning_updates(args, fixture_run_id, session_order[phase_index - 1], scopes, embedding_headers, database)
             phase_tasks = [task for task in tasks if task["phase"] == phase]
-            if phase == "after_learning" and phase_tasks and not learning_applied:
-                apply_learning_updates(args, fixture_run_id, scopes, embedding_headers, database)
-                learning_applied = True
             task_runs = [(task, repeat) for repeat in range(args.repeats) for task in phase_tasks]
             rng.shuffle(task_runs)
-            file_mode = "w" if phase == "before_learning" else "a"
+            file_mode = "w" if phase_index == 0 else "a"
             with results_path.open(file_mode, encoding="utf-8") as results_file, key_path.open(file_mode, encoding="utf-8") as key_file:
                 for task, repeat in task_runs:
                     task_arms = list(arms)

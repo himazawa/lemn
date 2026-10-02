@@ -1,4 +1,5 @@
 {
+  "session_order": ["session_1", "session_2", "session_3"],
   "projects": {
     "alpha": {
       "agents_file": "memory_bench_projects/alpha/AGENTS.md",
@@ -6,12 +7,20 @@
         {"state":"AUTHORITATIVE","summary":"In project alpha, the billing API staging deployment is in eu-west-1."},
         {"state":"AUTHORITATIVE","summary":"In project alpha, the billing service retries failed requests up to 2 times."}
       ],
-      "updates": [
-        {
-          "target_summary":"In project alpha, the billing service retries failed requests up to 2 times.",
-          "summary":"In project alpha, the billing service retries failed requests up to 4 times."
-        }
-      ]
+      "updates_after": {
+        "session_1": [
+          {
+            "target_summary":"In project alpha, the billing service retries failed requests up to 2 times.",
+            "summary":"In project alpha, the billing service retries failed requests up to 4 times."
+          }
+        ],
+        "session_2": [
+          {
+            "target_summary":"In project alpha, the billing service retries failed requests up to 4 times.",
+            "summary":"In project alpha, the billing service retries failed requests up to 5 times."
+          }
+        ]
+      }
     },
     "beta": {
       "agents_file": "memory_bench_projects/beta/AGENTS.md",
