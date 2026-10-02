@@ -140,11 +140,13 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 
 	preAutoState := extractionState(DetectCorrectionIntent(t.UserMessage).IsExplicitOverride, relation, relevant)
 	mem.State = autoPromoteState(preAutoState, mem.Confidence)
-	if mem.State == "AUTHORITATIVE" {
+	autoPromote := mem.State == "AUTHORITATIVE"
+	if autoPromote {
 		mem.Provenance["auto_promoted"] = true
 		if preAutoState == "OBSERVED" {
 			mem.Provenance["auto_promote_reason"] = "confidence"
 		}
+		mem.State = preAutoState
 	}
 
 	autoConfirm := shouldAutoConfirm(relation, mem.Confidence, relevant, mem.Provenance)
@@ -156,12 +158,10 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 	if err != nil {
 		return 0, err
 	}
-	if autoConfirm {
+	if autoConfirm || autoPromote {
 		if err := ConfirmPendingMemory(ctx, db, id); err != nil {
-			// Fail safe: the memory stays PENDING_CONFIRMATION for human
-			// review. Do not return the error — the row already exists, so
-			// a job retry would insert a duplicate.
-			log.Printf("[AutoSupersede] memory #%d left in PENDING_CONFIRMATION: %v", id, err)
+			// Keep the original reviewable state; do not retry the job and insert a duplicate.
+			log.Printf("[AutoPromotion] memory #%d remains %s after confirmation failed: %v", id, preAutoState, err)
 		}
 	}
 	return id, nil

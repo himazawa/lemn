@@ -263,17 +263,12 @@ touches `lemn_edges`. The one exception is the automatic confirmation of
 evidence-backed, high-confidence relation proposals (see the write-path note
 above): it does not bypass the reviewed path, it *is* the reviewed path with
 the human step satisfied by tool evidence plus a stricter confidence bar,
-and it runs the identical transaction.
-
-**Dependencies are the gap.** `depends_on` does *not* force
-`PENDING_CONFIRMATION` — only supersedes/contradicts/correction do. So a memory
-that proposes dependencies but no destructive relation can auto-promote. On that
-path the proposed `depends_on` IDs are stored in provenance but **never written
-to the edge graph**, and because the memory is already `AUTHORITATIVE` it does
-not reappear in `lemn pending` — the dependencies are silently dropped. Only
-dependencies on a memory that *stays* in the queue (a low-confidence `OBSERVED`)
-get applied, via `lemn confirm`. Treat proposed dependencies on auto-promoted
-memories as not-yet-wired until that is fixed.
+and it runs the identical transaction. Safe independent claims that qualify for
+automatic promotion now also pass through this transaction: dependency IDs are
+validated and their `depends_on` edges are written atomically with promotion.
+If validation fails, the memory remains in its reviewable pre-promotion state
+and the daemon logs the failure rather than marking it authoritative without
+its dependency graph.
 
 Only `AUTHORITATIVE` memories are ever retrieved. That is the whole point of the
 state machine: nothing reaches your prompt until it has either earned automatic
