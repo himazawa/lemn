@@ -113,14 +113,47 @@ func TestValidateRelationChoice(t *testing.T) {
 }
 
 func TestRejectionStagesRemainDistinct(t *testing.T) {
-	gateReject := rejectedByWorthinessGate(0.21, 0.73, true)
-	if gateReject.MemoryWorthy || gateReject.GatePassed || gateReject.GateProbability != 0.21 || gateReject.GlobalProbability != 0.73 || !gateReject.GlobalScoped || gateReject.Confidence != 0 {
+	gateReject := rejectedByWorthinessGate(0.21, 0.73, true, true)
+	if gateReject.MemoryWorthy || gateReject.GatePassed || gateReject.GateProbability != 0.21 || gateReject.GlobalProbability != 0.73 || !gateReject.GlobalScoped || !gateReject.GlobalScopeExplicit || gateReject.Confidence != 0 {
 		t.Fatalf("gate rejection = %+v, want gate/global probabilities preserved without extraction confidence", gateReject)
 	}
 
-	extractorVeto := rejectedByExtractor(0.72, 0.81, 0.93, true)
-	if extractorVeto.MemoryWorthy || !extractorVeto.GatePassed || extractorVeto.GateProbability != 0.72 || extractorVeto.GlobalProbability != 0.81 || !extractorVeto.GlobalScoped || extractorVeto.Confidence != 0.93 {
-		t.Fatalf("extractor veto = %+v, want gate/global predictions and extraction confidence preserved", extractorVeto)
+	extractorVeto := rejectedByExtractor(0.72, 0.81, 0.93, true, true, "none_type")
+	if extractorVeto.MemoryWorthy || !extractorVeto.GatePassed || extractorVeto.GateProbability != 0.72 || extractorVeto.GlobalProbability != 0.81 || !extractorVeto.GlobalScoped || !extractorVeto.GlobalScopeExplicit || extractorVeto.Confidence != 0.93 || extractorVeto.ExtractorVetoReason != "none_type" {
+		t.Fatalf("extractor veto = %+v, want stage probabilities, confidence and veto reason preserved", extractorVeto)
+	}
+}
+
+func TestExtractorVetoReason(t *testing.T) {
+	tests := []struct {
+		name    string
+		typ     string
+		summary string
+		want    string
+	}{
+		{name: "empty type", want: "empty_type"},
+		{name: "none type", typ: "none", want: "none_type"},
+		{name: "meta summary", typ: "architecture", summary: "The assistant explains the project design.", want: "meta_summary"},
+		{name: "durable claim", typ: "decision", summary: "The service uses PostgreSQL."},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := extractionVetoReason(test.typ, test.summary)
+			if got != test.want {
+				t.Fatalf("extractionVetoReason() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestTransientInstructionVetoTakesPrecedence(t *testing.T) {
+	got := extractionVetoReasonForTurn(
+		"preference",
+		"The user prefers concise answers.",
+		"For this answer only, keep it short.",
+	)
+	if got != "transient_instruction" {
+		t.Fatalf("extractionVetoReasonForTurn() = %q, want transient_instruction", got)
 	}
 }
 

@@ -842,18 +842,21 @@ updates. Repeat with more varied facts and wording before drawing conclusions.
 
 `scripts/memory_write_bench.py` runs labeled turns through the real `/log` worker
 path: Laya worthiness gate, extractor, cosine evidence check, relation handling,
-and Postgres routing. It starts a one-off daemon with a temporary SQLite file,
-uses unique Postgres project scopes, and stops the daemon and deletes those
-scoped memories at the end. `/jobs/{id}` is an authenticated read-only endpoint
-used to wait for a durable job and inspect its extraction result; it never
-returns the submitted turn payload.
+and Postgres routing. Every case/repeat gets its own temporary Postgres database
+initialized from `schema.sql`, plus a one-off daemon with a temporary SQLite
+file. This isolates even `global`-scope writes from production and from other
+benchmark cases. The runner stops the daemon and drops the database afterward.
+`/jobs/{id}` is an authenticated read-only endpoint used to wait for a durable
+job and inspect its extraction result; it never returns the submitted turn
+payload.
 
 The labeled cases in `scripts/memory_write_bench_cases.jsonl` cover durable
 decisions and preferences, explicit corrections, tool-backed changes, simple
 and tool-backed lookups, acknowledgements, recaps, tentative ideas, and
 one-answer-only instructions. `--repeats N` runs every case N times in fresh
 scopes and reseeds any starting memory for each trial, so one extraction cannot
-affect the next. Validate without starting services, then run from the
+affect the next. Each repeat starts a fresh daemon/database pair, so repeated
+runs take longer. Validate without starting services, then run from the
 repository root with Docker Compose, Postgres, Laya, and the model/embedding
 endpoint available:
 
@@ -864,6 +867,9 @@ python3 scripts/memory_write_bench.py --repeats 3 \
   --out /tmp/lemn-memory-write-bench
 ```
 
+Use `--case-ids durable-user-preference,one-answer-style-request --repeats 3`
+to rerun only preference capture and transient-instruction rejection.
+
 The report separates **gate** precision/recall from **final memory**
 precision/recall, and includes extractor vetoes, summary term checks, global
 scope checks, relation checks, and descriptive evidence/target cosine
@@ -871,34 +877,54 @@ distributions. It writes detailed per-case extraction and created-memory
 provenance to `write-results.json`. These are hand-labeled examples, so treat
 the scores as diagnostics rather than a calibrated quality estimate.
 
-The initial six-case smoke run on 2026-10-02 had gate precision `0.67` and recall
-`1.00`; the extractor vetoed the one lookup that passed the gate. Its tool-backed
-supersede scored `0.784` evidence cosine and `0.880` target similarity, above the
-existing `0.60` and `0.82` cutoffs. It also exposed malformed optional
-`depends_on` output, which the daemon now logs and ignores instead of dropping
-the entire extraction.
+The latest contamination-free run on 2026-10-03 scored 20 cases three times
+each (60 turns). **Each trial used its own newly created Postgres database and
+one-off daemon**, so even `global`-scope preference memories could not interact
+with other fixtures or production. The production global-memory count remained
+18, and all scratch databases were dropped afterward.
 
-An expanded 11-case, three-repeat run had gate precision `0.625` and recall
-`1.00`; final memory precision was `1.00` and recall `0.80`. The gate passed all
-15 positive trials, but also passed 9/18 negative trials. The extractor vetoed
-all 9 gate false positives, but also vetoed the durable preference on all three
-repeats. That preference received memory-gate probability `0.7948` and global
-probability `0.8395`, yet produced no memory. A separate three-repeat check
-confirmed both durable and one-answer-only style requests were marked
-project-scoped (`global_scoped=false`): their global probabilities were
-`0.8395` and `0.8044`, below the `0.90` cutoff. Thus the durable preference
-misses both at extraction and at global-scope classification, while the
-temporary request is correctly not made global but still passes the broad
-worthiness gate (`0.7392`) before being vetoed. These point to separate areas
-to investigate: extractor preference handling, global preference detection,
-and specificity in the broad worthiness gate. This is a small labeled set, not
-a reason to move thresholds yet.
+Results: the worthiness gate passed all 33 expected positives (recall `1.00`)
+but also passed 15/27 negatives (precision `0.688`). Extraction saved all 33
+positives and rejected all 27 negatives (final precision/recall `1.00` on these
+labels); it vetoed 9 gate false positives as `none` and 6 temporary instructions
+as `transient_instruction`. All 33 expected global/project-scope decisions
+matched, all 27 relation labels matched, and repeat decisions were identical
+for gate, final save, and scope. Exact summary text consistency was `0.917`.
 
-Across the tool-backed cases, evidence cosine ranged from `0.784` to `0.856`
-(mean `0.830`); target similarity ranged from `0.880` to `0.890` (mean `0.885`).
-The cosine thresholds remain unchanged. Three repeats of this small synthetic
-case set are useful for checking run stability, but not enough independent
-examples to calibrate similarity cutoffs.
+The raw Laya global-scope classifier still scored every tested durable
+cross-project preference below its `0.90` cutoff; wording variants did not
+separate the labeled positives and negatives at that threshold. The explicit
+cue override recovered the five durable preference cases, while project-local
+facts stayed local and temporary instructions were blocked. Treat this as a
+narrow, explicitly worded path, not proof that arbitrary preference phrasing is
+handled. Keep adding paraphrases and counterexamples before broadening it or
+changing the global threshold.
+
+Cosine thresholds were unchanged. Across this run, evidence cosine was
+`0.784`–`0.861` in 9 observations and target similarity was `0.880`–`0.908` in 6
+observations. These counts are still too small and too synthetic to calibrate
+either cutoff. The suite exercises extraction and routing on labeled turns but
+is not a representative traffic sample or a statistical quality guarantee.
+
+After isolating every trial in its own scratch database, the full 20-case x
+three-repeat run on 2026-10-02 scored 60 turns: gate precision `0.688`, recall
+`1.00`; final memory precision and recall were both `1.00`. All 33 labeled
+positive turns were saved, all 27 negative turns were rejected or vetoed, all
+27 expected relation decisions matched, and all 33 expected global/project
+scope decisions matched. The gate still admitted 15 negative turns; the
+extractor vetoed 9 as `none` and the transient-instruction guard vetoed 6. The
+global cue override fired on 15 turns. Repeat decisions were identical for
+gate, save/no-save, and scope on every case; exact summary text consistency was
+`0.917`. Cosine thresholds remain unchanged: tool evidence ranged `0.784`–`0.861`
+and target similarity `0.880`–`0.908` in 9 and 6 observed comparisons,
+respectively.
+
+This run used one disposable database per case/repeat, so explicit `global`
+memories could not interact across fixtures or with production. After cleanup,
+the production database still had 18 global memories and there were zero
+`lemn_writebench_*` databases remaining. These are still synthetic, hand-labeled
+cases; the repeated consistency result measures these exact examples, not
+generalization to natural traffic.
 
 ## Running without Docker
 
@@ -950,7 +976,7 @@ Every memory carries a `project_id`. The Pi extension derives it from the git re
 
 The scope `global` is special: those memories apply everywhere. Use it for durable user-level preferences rather than project facts.
 
-Scope is chosen automatically. `/memory-worthiness` answers a second typed question, `globally_applicable`, asking whether the turn describes a durable preference of the *user* that holds across every codebase, rather than a fact belonging to one repository. If yes the memory is stored as `global`; otherwise it takes the caller's `project_id`. Tune the cutoff with `LAYA_GLOBAL_THRESHOLD`, and watch the daemon's `[Gate]` log lines to see both probabilities per turn.
+Scope is chosen automatically. `/memory-worthiness` answers a second typed question, `globally_applicable`, asking whether the turn describes a durable preference of the *user* that holds across every codebase, rather than a fact belonging to one repository. A narrow explicit-language rule also selects global scope when the user's own message combines durable-preference language (`prefer`, `preference`, or `for future`) with an unambiguous cross-project phrase (`across all projects`, `across my projects`, or `in every project`). One-answer/task-only phrases block that override. The raw Laya probability is retained for measurement. Otherwise, the Laya result selects `global` or the caller's `project_id`. Tune the cutoff with `LAYA_GLOBAL_THRESHOLD`, and watch the daemon's `[Gate]` log lines to see both probabilities per turn.
 
 The read and write rules are deliberately asymmetric:
 

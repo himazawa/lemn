@@ -49,6 +49,48 @@ func TestDetectCorrectionIntent(t *testing.T) {
 	}
 }
 
+func TestDetectExplicitGlobalPreference(t *testing.T) {
+	tests := []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{name: "explicit across all projects preference", message: "Across all projects, I prefer concise answers.", want: true},
+		{name: "preference in every project", message: "I prefer metric units in every project.", want: true},
+		{name: "future convention across my projects", message: "For future code reviews across my projects, lead with risks first.", want: true},
+		{name: "lasting preference no matter which project", message: "No matter which project we're in, use ISO dates; that's my lasting preference.", want: true},
+		{name: "likes in any codebase", message: "Please remember I like examples first in any codebase.", want: true},
+		{name: "project-specific convention is not global", message: "For this repository, use integration tests.", want: false},
+		{name: "single answer instruction is not global", message: "For this answer only, keep it brief.", want: false},
+		{name: "global topic without durable preference is not enough", message: "We changed all projects to use PostgreSQL.", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := DetectExplicitGlobalPreference(test.message); got != test.want {
+				t.Fatalf("DetectExplicitGlobalPreference(%q) = %v, want %v", test.message, got, test.want)
+			}
+		})
+	}
+}
+
+func TestIsTransientInstruction(t *testing.T) {
+	tests := []struct {
+		message string
+		want    bool
+	}{
+		{message: "For this answer only, keep it short.", want: true},
+		{message: "Use this setting for this task only.", want: true},
+		{message: "Just this time, skip the examples.", want: true},
+		{message: "Across all projects, I prefer concise answers.", want: false},
+		{message: "For future reviews, lead with risks.", want: false},
+	}
+	for _, test := range tests {
+		if got := IsTransientInstruction(test.message); got != test.want {
+			t.Errorf("IsTransientInstruction(%q) = %v, want %v", test.message, got, test.want)
+		}
+	}
+}
+
 func TestSupersedeThreshold(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		t.Setenv("LEMN_SUPERSEDE_THRESHOLD", "")

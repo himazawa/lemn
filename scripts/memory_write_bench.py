@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 import json
 import os
 import re
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+from urllib.parse import quote
 import urllib.request
 import uuid
 from pathlib import Path
@@ -70,15 +72,43 @@ def sql_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def run_psql(sql: str) -> list[str]:
+def run_psql(sql: str, database: str | None = None) -> list[str]:
+    database_arg = database or os.environ.get("POSTGRES_DB", "lemn_kernel")
     command = [
         "docker", "compose", "exec", "-T", "postgres", "sh", "-c",
-        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
+        'psql -X -qAt -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$1"', "sh", database_arg,
     ]
     result = subprocess.run(command, cwd=REPO_DIR, input=sql, text=True, capture_output=True, check=False)
     if result.returncode:
         raise RuntimeError(f"Postgres fixture operation failed: {result.stderr.strip()}")
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def create_isolated_database(run_id: str) -> tuple[str, str]:
+    user = os.environ.get("POSTGRES_USER", "lemn")
+    password = os.environ.get("POSTGRES_PASSWORD", "")
+    if not password:
+        raise ValueError("POSTGRES_PASSWORD must be loaded from .env for isolated write benchmarking")
+    database = f"lemn_writebench_{run_id}"
+    run_psql(f'CREATE DATABASE "{database}";')
+    try:
+        schema = (REPO_DIR / "schema.sql").read_text(encoding="utf-8")
+        run_psql(schema, database=database)
+    except Exception:
+        drop_isolated_database(database)
+        raise
+    dsn = f"postgres://{quote(user, safe='')}:{quote(password, safe='')}@postgres:5432/{database}?sslmode=disable"
+    print(f"Created isolated Postgres database {database}; production memory DB is not used.")
+    return database, dsn
+
+
+def drop_isolated_database(database: str) -> None:
+    run_psql(f'DROP DATABASE IF EXISTS "{database}" WITH (FORCE);')
+    remaining = run_psql(
+        f"SELECT count(*) FROM pg_database WHERE datname = {sql_literal(database)};",
+    )
+    if remaining != ["0"]:
+        raise RuntimeError(f"benchmark database {database} still exists")
 
 
 def embed(text: str, args: argparse.Namespace, headers: dict[str, str]) -> list[float]:
@@ -105,7 +135,7 @@ def scope_key(case_id: str, repeat: int) -> str:
     return f"{case_id}#repeat-{repeat}"
 
 
-def seed_existing_memories(case_runs: list[tuple[dict[str, Any], int]], scopes: dict[str, str], run_id: str, args: argparse.Namespace, headers: dict[str, str]) -> dict[str, list[int]]:
+def seed_existing_memories(case_runs: list[tuple[dict[str, Any], int]], scopes: dict[str, str], run_id: str, args: argparse.Namespace, headers: dict[str, str], database: str) -> dict[str, list[int]]:
     statements = ["BEGIN;"]
     ids_by_case: dict[str, list[int]] = {}
     expected_count = 0
@@ -125,9 +155,9 @@ def seed_existing_memories(case_runs: list[tuple[dict[str, Any], int]], scopes: 
             expected_count += 1
         ids_by_case[key] = case_ids
     statements.append("COMMIT;")
-    returned = run_psql("\n".join(statements))
+    returned = run_psql("\n".join(statements), database=database)
     if len(returned) != expected_count or any(not value.isdigit() for value in returned):
-        cleanup_memories(scopes)
+        cleanup_memories(scopes, database)
         raise RuntimeError(f"expected {expected_count} initial memory IDs, received {returned}")
     index = 0
     for case, repeat in case_runs:
@@ -138,36 +168,40 @@ def seed_existing_memories(case_runs: list[tuple[dict[str, Any], int]], scopes: 
     return ids_by_case
 
 
-def cleanup_memories(scopes: dict[str, str]) -> None:
+def cleanup_memories(scopes: dict[str, str], database: str) -> None:
     scope_list = ",".join(sql_literal(scope) for scope in scopes.values())
     run_psql(
         "BEGIN;\n"
         f"DELETE FROM lemn_edges WHERE source_id IN (SELECT id FROM lemn_memories WHERE project_id IN ({scope_list})) "
         f"OR target_id IN (SELECT id FROM lemn_memories WHERE project_id IN ({scope_list}));\n"
         f"DELETE FROM lemn_memories WHERE project_id IN ({scope_list});\n"
-        "COMMIT;"
+        "COMMIT;",
+        database=database,
     )
-    remaining = run_psql(f"SELECT count(*) FROM lemn_memories WHERE project_id IN ({scope_list});")
+    remaining = run_psql(f"SELECT count(*) FROM lemn_memories WHERE project_id IN ({scope_list});", database=database)
     if remaining != ["0"]:
         raise RuntimeError(f"write-benchmark cleanup left rows in scopes {list(scopes.values())}: {remaining}")
 
 
-def read_created_memories(scope: str, turn_id: str) -> list[dict[str, Any]]:
+def read_created_memories(scope: str, turn_id: str, database: str) -> list[dict[str, Any]]:
     query = (
         "SELECT COALESCE(json_agg(json_build_object('id', id, 'state', state, 'summary', summary, "
         "'confidence', confidence, 'provenance', provenance)), '[]'::json)::text "
         f"FROM lemn_memories WHERE project_id = {sql_literal(scope)} "
         f"AND provenance->>'source_turn_id' = {sql_literal(turn_id)};"
     )
-    result = run_psql(query)
+    result = run_psql(query, database=database)
     return json.loads(result[0]) if result else []
 
 
-def start_isolated_daemon(run_id: str, startup_timeout: int) -> tuple[str, str]:
+def start_isolated_daemon(run_id: str, startup_timeout: int, postgres_dsn: str) -> tuple[str, str]:
     sqlite_path = f"/tmp/lemn-writebench-{run_id}.db"
     command = [
         "docker", "compose", "run", "--detach", "--rm", "--build", "--no-deps",
-        "--publish", "127.0.0.1::8080", "--env", f"LEMN_SQLITE_PATH={sqlite_path}", "daemon",
+        "--publish", "127.0.0.1::8080",
+        "--env", f"LEMN_SQLITE_PATH={sqlite_path}",
+        "--env", f"LEMN_POSTGRES_DSN={postgres_dsn}",
+        "daemon",
     ]
     result = subprocess.run(command, cwd=REPO_DIR, text=True, capture_output=True, check=False)
     if result.returncode:
@@ -219,18 +253,23 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
     gate_tp = gate_fp = gate_tn = gate_fn = 0
     final_tp = final_fp = final_tn = final_fn = 0
     extractor_vetoes = 0
+    veto_reasons: Counter[str] = Counter()
     summary_checked = summary_passed = 0
     relation_checked = relation_passed = 0
     global_checked = global_passed = 0
+    explicit_global_overrides = 0
     evidence_scores: list[float] = []
     target_scores: list[float] = []
+    by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in results:
+        by_case[row["case_id"]].append(row)
         case = cases_by_id[row["case_id"]]
         extraction = row.get("extraction") or {}
         expected_final = case["expected_memory_worthy"]
         actual_final = bool(extraction.get("memory_worthy"))
         expected_gate = case.get("expected_gate_passed", expected_final)
         actual_gate = bool(extraction.get("gate_passed"))
+        explicit_global_overrides += int(bool(extraction.get("global_scope_explicit")))
         if expected_gate and actual_gate:
             gate_tp += 1
         elif actual_gate:
@@ -249,6 +288,7 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
             final_tn += 1
         if actual_gate and not actual_final:
             extractor_vetoes += 1
+            veto_reasons[str(extraction.get("extractor_veto_reason") or "unspecified")] += 1
         if expected_final:
             summary_checked += 1
             summary = str(extraction.get("summary", ""))
@@ -278,6 +318,35 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
             return {"count": 0, "mean": None, "min": None, "max": None}
         return {"count": len(values), "mean": sum(values) / len(values), "min": min(values), "max": max(values)}
 
+    def majority_consistency(values: list[Any]) -> float:
+        if not values:
+            return 1.0
+        counts = Counter(values)
+        return max(counts.values()) / len(values)
+
+    repeat_consistency = {
+        "cases_repeated": 0,
+        "gate_decision": [],
+        "final_memory_decision": [],
+        "global_scope_decision": [],
+        "summary_exact": [],
+        "relation": [],
+    }
+    for case_rows in by_case.values():
+        if len(case_rows) < 2:
+            continue
+        repeat_consistency["cases_repeated"] += 1
+        extractions = [row.get("extraction") or {} for row in case_rows]
+        repeat_consistency["gate_decision"].append(majority_consistency([bool(item.get("gate_passed")) for item in extractions]))
+        repeat_consistency["final_memory_decision"].append(majority_consistency([bool(item.get("memory_worthy")) for item in extractions]))
+        repeat_consistency["global_scope_decision"].append(majority_consistency([bool(item.get("global_scoped")) for item in extractions]))
+        repeat_consistency["summary_exact"].append(majority_consistency([str(item.get("summary", "")).strip().casefold() for item in extractions]))
+        repeat_consistency["relation"].append(majority_consistency([str(item.get("relation", "independent")) for item in extractions]))
+    for key, values in list(repeat_consistency.items()):
+        if key == "cases_repeated":
+            continue
+        repeat_consistency[key] = sum(values) / len(values) if values else None
+
     return {
         "cases": len(results),
         "gate_true_positive": gate_tp, "gate_false_positive": gate_fp,
@@ -287,12 +356,81 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
         "final_true_negative": final_tn, "final_false_negative": final_fn,
         "final_precision": final_precision, "final_recall": final_recall, "final_f1": final_f1,
         "extractor_vetoes": extractor_vetoes,
+        "extractor_veto_reasons": dict(veto_reasons),
         "summary_terms_passed": summary_passed, "summary_terms_checked": summary_checked,
         "relation_passed": relation_passed, "relation_checked": relation_checked,
         "global_scope_passed": global_passed, "global_scope_checked": global_checked,
+        "explicit_global_overrides": explicit_global_overrides,
         "evidence_cosine": score_distribution(evidence_scores),
         "target_cosine": score_distribution(target_scores),
+        "repeat_consistency": repeat_consistency,
     }
+
+
+def run_trial(
+    case: dict[str, Any],
+    repeat: int,
+    run_id: str,
+    args: argparse.Namespace,
+    auth_headers: dict[str, str],
+    embedding_headers: dict[str, str],
+) -> dict[str, Any]:
+    trial_id = uuid.uuid4().hex[:12]
+    database, postgres_dsn = create_isolated_database(trial_id)
+    scope = f"lemn-writebench-{trial_id}-{case['id']}-r{repeat}"
+    scopes = {scope_key(case["id"], repeat): scope}
+    container_id = ""
+    try:
+        container_id, base_url = start_isolated_daemon(trial_id, args.startup_timeout, postgres_dsn)
+        seed_existing_memories([(case, repeat)], scopes, trial_id, args, embedding_headers, database)
+        turn_id = f"writebench_{run_id}_{case['id']}_r{repeat}"
+        payload = {
+            "id": turn_id,
+            "project_id": scope,
+            "user_message": case["user_message"],
+            "assistant_response": case["assistant_response"],
+            "tool_calls": case.get("tool_calls", []),
+        }
+        queued = request_json(base_url + "/log", payload, auth_headers, args.request_timeout)
+        job = wait_for_job(base_url, int(queued["job_id"]), auth_headers, args.job_timeout)
+        if job["status"] != "COMPLETED":
+            result = {
+                "case_id": case["id"],
+                "repeat": repeat,
+                "turn_id": turn_id,
+                "project_id": scope,
+                "job_id": queued["job_id"],
+                "job_error": job.get("error", f"job status {job['status']}"),
+                "extraction": {},
+                "created_memories": [],
+            }
+            print(f"{case['id']} repeat {repeat}: JOB FAILED: {job.get('error', job['status'])}")
+            return result
+        extraction = job.get("extraction") or {}
+        memories = read_created_memories(scope, turn_id, database)
+        print(f"{case['id']} repeat {repeat}: memory_worthy={extraction.get('memory_worthy')} summary={extraction.get('summary', '')!r}")
+        return {
+            "case_id": case["id"],
+            "repeat": repeat,
+            "turn_id": turn_id,
+            "project_id": scope,
+            "job_id": queued["job_id"],
+            "extraction": extraction,
+            "created_memories": memories,
+        }
+    finally:
+        cleanup_error = None
+        if container_id:
+            try:
+                stop_isolated_daemon(container_id)
+            except Exception as exc:
+                cleanup_error = exc
+        try:
+            drop_isolated_database(database)
+        except Exception as exc:
+            cleanup_error = cleanup_error or exc
+        if cleanup_error:
+            raise cleanup_error
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
@@ -321,68 +459,7 @@ def run_benchmark(args: argparse.Namespace) -> None:
     auth_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {secret}"}
     run_id = uuid.uuid4().hex[:12]
     case_runs = [(case, repeat) for repeat in range(1, args.repeats + 1) for case in cases]
-    scopes = {
-        scope_key(case["id"], repeat): f"lemn-writebench-{run_id}-{case['id']}-r{repeat}"
-        for case, repeat in case_runs
-    }
-    container_id = ""
-    memory_rows_seeded = False
-    results = []
-    try:
-        container_id, base_url = start_isolated_daemon(run_id, args.startup_timeout)
-        seeded = seed_existing_memories(case_runs, scopes, run_id, args, embedding_headers)
-        memory_rows_seeded = True
-        for case, repeat in case_runs:
-            case_scope = scope_key(case["id"], repeat)
-            turn_id = f"writebench_{run_id}_{case['id']}_r{repeat}"
-            payload = {
-                "id": turn_id,
-                "project_id": scopes[case_scope],
-                "user_message": case["user_message"],
-                "assistant_response": case["assistant_response"],
-                "tool_calls": case.get("tool_calls", []),
-            }
-            queued = request_json(base_url + "/log", payload, auth_headers, args.request_timeout)
-            job = wait_for_job(base_url, int(queued["job_id"]), auth_headers, args.job_timeout)
-            if job["status"] != "COMPLETED":
-                results.append({
-                    "case_id": case["id"],
-                    "repeat": repeat,
-                    "turn_id": turn_id,
-                    "project_id": scopes[case_scope],
-                    "job_id": queued["job_id"],
-                    "job_error": job.get("error", f"job status {job['status']}"),
-                    "extraction": {},
-                    "created_memories": [],
-                })
-                print(f"{case['id']}: JOB FAILED: {job.get('error', job['status'])}")
-                continue
-            extraction = job.get("extraction") or {}
-            memories = read_created_memories(scopes[case_scope], turn_id)
-            results.append({
-                "case_id": case["id"],
-                "repeat": repeat,
-                "turn_id": turn_id,
-                "project_id": scopes[case_scope],
-                "job_id": queued["job_id"],
-                "extraction": extraction,
-                "created_memories": memories,
-            })
-            print(f"{case['id']}: memory_worthy={extraction.get('memory_worthy')} summary={extraction.get('summary', '')!r}")
-    finally:
-        cleanup_error = None
-        if memory_rows_seeded:
-            try:
-                cleanup_memories(scopes)
-            except Exception as exc:
-                cleanup_error = exc
-        if container_id:
-            try:
-                stop_isolated_daemon(container_id)
-            except Exception as exc:
-                cleanup_error = cleanup_error or exc
-        if cleanup_error:
-            raise cleanup_error
+    results = [run_trial(case, repeat, run_id, args, auth_headers, embedding_headers) for case, repeat in case_runs]
 
     cases_by_id = {case["id"]: case for case in cases}
     report = evaluate(results, cases_by_id)

@@ -308,27 +308,50 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 	return nil
 }
 
-func rejectedByWorthinessGate(probability, globalProbability float64, globallyApplicable bool) lemn.ModelExtraction {
+func rejectedByWorthinessGate(probability, globalProbability float64, globallyApplicable, explicitGlobal bool) lemn.ModelExtraction {
 	return lemn.ModelExtraction{
-		MemoryWorthy:      false,
-		GatePassed:        false,
-		GlobalScoped:      globallyApplicable,
-		Type:              "none",
-		GateProbability:   probability,
-		GlobalProbability: globalProbability,
+		MemoryWorthy:        false,
+		GatePassed:          false,
+		GlobalScoped:        globallyApplicable,
+		GlobalScopeExplicit: explicitGlobal,
+		Type:                "none",
+		GateProbability:     probability,
+		GlobalProbability:   globalProbability,
 	}
 }
 
-func rejectedByExtractor(gateProbability, globalProbability, extractionConfidence float64, globallyApplicable bool) lemn.ModelExtraction {
+func rejectedByExtractor(gateProbability, globalProbability, extractionConfidence float64, globallyApplicable, explicitGlobal bool, reason string) lemn.ModelExtraction {
 	return lemn.ModelExtraction{
-		MemoryWorthy:      false,
-		GatePassed:        true,
-		GlobalScoped:      globallyApplicable,
-		Type:              "none",
-		Confidence:        extractionConfidence,
-		GateProbability:   gateProbability,
-		GlobalProbability: globalProbability,
+		MemoryWorthy:        false,
+		GatePassed:          true,
+		GlobalScoped:        globallyApplicable,
+		GlobalScopeExplicit: explicitGlobal,
+		Type:                "none",
+		Confidence:          extractionConfidence,
+		GateProbability:     gateProbability,
+		GlobalProbability:   globalProbability,
+		ExtractorVetoReason: reason,
 	}
+}
+
+func extractionVetoReason(extractionType, summary string) string {
+	switch {
+	case strings.TrimSpace(extractionType) == "":
+		return "empty_type"
+	case strings.EqualFold(strings.TrimSpace(extractionType), "none"):
+		return "none_type"
+	case lemn.IsMetaSummary(summary):
+		return "meta_summary"
+	default:
+		return ""
+	}
+}
+
+func extractionVetoReasonForTurn(extractionType, summary, userMessage string) string {
+	if lemn.IsTransientInstruction(userMessage) {
+		return "transient_instruction"
+	}
+	return extractionVetoReason(extractionType, summary)
 }
 
 func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtraction, error) {
@@ -336,8 +359,10 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 	if err != nil {
 		return lemn.ModelExtraction{}, err
 	}
+	explicitGlobal := lemn.DetectExplicitGlobalPreference(t.UserMessage)
+	globallyApplicable = globallyApplicable || explicitGlobal
 	if !memoryWorthy {
-		return rejectedByWorthinessGate(probability, globalProbability, globallyApplicable), nil
+		return rejectedByWorthinessGate(probability, globalProbability, globallyApplicable, explicitGlobal), nil
 	}
 
 	scope := lemn.NormalizeScope(t.ProjectID)
@@ -364,12 +389,14 @@ Assistant: %s
 
 Respond ONLY with JSON matching this format:
 
-{"type": "decision|architecture|bug_fix|none", "summary": "brief summary", "confidence": 0.0-1.0, "depends_on": []}
+{"type": "decision|architecture|bug_fix|preference|none", "summary": "brief summary", "confidence": 0.0-1.0, "depends_on": []}
 
 - depends_on may contain only IDs from the dependency candidate list, and only when this new claim relies on them remaining true. Do not infer dependencies from topical similarity.
 
 Summary rules:
 - State the durable fact itself (e.g. "The router uses a 25m idle timeout"), not what happened in the turn.
+- Use preference for a persistent user preference or interaction convention that should carry across future turns; preserve whether it is global or project-specific in the fact wording.
+- A one-answer or one-task instruction (e.g. "for this answer only, be brief") is not a durable preference; use type none.
 - Use type none when the turn only describes the conversation (what the assistant explained, outlined or answered) or confirms memory IDs, without a new fact about the project or user.
 
 Memory scope for this claim: %s
@@ -435,8 +462,9 @@ Authoritative memories eligible as dependencies (same scope or global):
 
 	// Type "none" is the extraction model's own veto: Laya thought the turn
 	// was worth a look, but there was no durable claim in it to store.
-	if payload.Type == "" || payload.Type == "none" || lemn.IsMetaSummary(payload.Summary) {
-		return rejectedByExtractor(probability, globalProbability, payload.Confidence, globallyApplicable), nil
+	vetoReason := extractionVetoReasonForTurn(payload.Type, payload.Summary, t.UserMessage)
+	if vetoReason != "" {
+		return rejectedByExtractor(probability, globalProbability, payload.Confidence, globallyApplicable, explicitGlobal, vetoReason), nil
 	}
 
 	relation := "independent"
@@ -465,6 +493,7 @@ Authoritative memories eligible as dependencies (same scope or global):
 		MemoryWorthy:           true,
 		GatePassed:             true,
 		GlobalScoped:           globallyApplicable,
+		GlobalScopeExplicit:    explicitGlobal,
 		GlobalProbability:      globalProbability,
 		Type:                   payload.Type,
 		Summary:                payload.Summary,
