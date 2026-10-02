@@ -110,3 +110,23 @@ func TestCosineThresholdSignalBoundary(t *testing.T) {
 		t.Fatalf("cosine score %v at the configured boundary should be relevant", score)
 	}
 }
+
+func TestRevalidationRequiresEvidenceOrUserConfirmation(t *testing.T) {
+	err := RevalidateMemory(context.Background(), nil, 1, RevalidationDecision{})
+	if err == nil || err.Error() != "revalidation requires an evidence note or explicit user confirmation" {
+		t.Fatalf("RevalidateMemory() error = %v, want explicit attestation error", err)
+	}
+}
+
+func TestUniqueSortedIDs(t *testing.T) {
+	got := uniqueSortedIDs([]int{9, 2, 9, 1, 2})
+	want := []int{1, 2, 9}
+	if len(got) != len(want) {
+		t.Fatalf("uniqueSortedIDs() = %v, want %v", got, want)
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("uniqueSortedIDs() = %v, want %v", got, want)
+		}
+	}
+}

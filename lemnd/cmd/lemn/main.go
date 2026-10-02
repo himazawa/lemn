@@ -45,6 +45,12 @@ func main() {
 			return
 		}
 		confirmMemories(db, os.Args[2:])
+	case "revalidate":
+		if len(os.Args) < 3 {
+			fmt.Println("Usage: lemn revalidate [--evidence note | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <memory_id>")
+			return
+		}
+		revalidateMemory(db, os.Args[2:])
 	case "reject":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: lemn reject <memory_id> [memory_id...]")
@@ -62,6 +68,7 @@ func printUsage() {
 	fmt.Println("LEMN Admin CLI")
 	fmt.Println("  lemn pending           - List OBSERVED, CANDIDATE, pending, and revalidation memories")
 	fmt.Println("  lemn confirm <id> [id...] [--relation independent|supersedes|contradicts] [--target id] [--depends-on id,id|--clear-dependencies]")
+	fmt.Println("  lemn revalidate [--evidence note | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <id>")
 	fmt.Println("  lemn reject <id> [id...] - Mark reviewable memories REJECTED")
 	fmt.Println("  lemn sweep [--apply]   - Re-apply auto-review rules to the queue (dry run without --apply)")
 }
@@ -122,7 +129,7 @@ func listPending(db *sql.DB) {
 		if len(provenanceJSON) > 0 {
 			var prov map[string]interface{}
 			json.Unmarshal(provenanceJSON, &prov)
-			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "evidence_source", "signals"} {
+			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "revalidation_history"} {
 				if value, ok := prov[key]; ok {
 					encoded, _ := json.Marshal(value)
 					fmt.Printf("      %s: %s\n", key, encoded)
@@ -218,6 +225,78 @@ func confirmMemories(db *sql.DB, args []string) {
 	if failed {
 		os.Exit(1)
 	}
+}
+
+func revalidateMemory(db *sql.DB, args []string) {
+	flagTakesValue := map[string]bool{"evidence": true, "summary": true, "depends-on": true}
+	var flagArgs, ids []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !strings.HasPrefix(arg, "-") {
+			ids = append(ids, arg)
+			continue
+		}
+		name := strings.TrimLeft(arg, "-")
+		if equals := strings.IndexByte(name, '='); equals >= 0 {
+			name = name[:equals]
+		}
+		flagArgs = append(flagArgs, arg)
+		if flagTakesValue[name] && !strings.Contains(arg, "=") && index+1 < len(args) {
+			index++
+			flagArgs = append(flagArgs, args[index])
+		}
+	}
+
+	flags := flag.NewFlagSet("revalidate", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	evidence := flags.String("evidence", "", "fresh evidence note supporting the memory")
+	userConfirmed := flags.Bool("user-confirmed", false, "record explicit user confirmation")
+	summary := flags.String("summary", "", "replace the memory summary")
+	dependsOn := flags.String("depends-on", "", "replace dependencies with comma-separated memory IDs")
+	clearDependencies := flags.Bool("clear-dependencies", false, "remove all dependencies")
+	if err := flags.Parse(flagArgs); err != nil {
+		return
+	}
+	if len(ids) != 1 {
+		fmt.Fprintln(os.Stderr, "Usage: lemn revalidate [--evidence note | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <memory_id>")
+		return
+	}
+	if *dependsOn != "" && *clearDependencies {
+		fmt.Fprintln(os.Stderr, "use either --depends-on or --clear-dependencies")
+		return
+	}
+	memoryID, err := strconv.Atoi(ids[0])
+	if err != nil || memoryID <= 0 {
+		fmt.Fprintf(os.Stderr, "invalid memory ID %q\n", ids[0])
+		return
+	}
+
+	decision := lemn.RevalidationDecision{
+		Evidence:      *evidence,
+		UserConfirmed: *userConfirmed,
+		Summary:       *summary,
+	}
+	if *dependsOn != "" || *clearDependencies {
+		decision.ReplaceDependencies = true
+		if *dependsOn != "" {
+			for _, rawID := range strings.Split(*dependsOn, ",") {
+				dependencyID, err := strconv.Atoi(strings.TrimSpace(rawID))
+				if err != nil || dependencyID <= 0 {
+					fmt.Fprintf(os.Stderr, "invalid dependency ID %q\n", rawID)
+					return
+				}
+				decision.DependsOn = append(decision.DependsOn, dependencyID)
+			}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := lemn.RevalidateMemory(ctx, db, memoryID, decision); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to revalidate memory #%d: %v\n", memoryID, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Memory #%d revalidated as AUTHORITATIVE.\n", memoryID)
 }
 
 func rejectMemories(db *sql.DB, idStrs []string) {

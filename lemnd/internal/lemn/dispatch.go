@@ -324,6 +324,11 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 	var actions []SweepAction
 	for _, r := range pending {
 		a := SweepAction{ID: r.id, Summary: r.summary}
+		if r.state == "NEEDS_REVALIDATION" {
+			a.Action, a.Reason = "keep", "requires fresh evidence or explicit user confirmation"
+			actions = append(actions, a)
+			continue
+		}
 		if IsMetaSummary(r.summary) {
 			a.Action, a.Reason = "reject", "narrates the conversation"
 			if apply {

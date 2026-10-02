@@ -233,15 +233,21 @@ curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $LEMN_SHARED_S
     confirm supersedes ──▶ prior target: SUPERSEDED
     confirm contradicts ─▶ prior target: CONTRADICTED
     (either) ─▶ target's dependents: NEEDS_REVALIDATION
-    confirm revalidated memory ──▶ AUTHORITATIVE
+    NEEDS_REVALIDATION
+      ├── lemn revalidate --evidence <note> ──▶ AUTHORITATIVE
+      ├── lemn revalidate --user-confirmed ────▶ AUTHORITATIVE
+      └── lemn reject ─────────────────────────▶ REJECTED
 ```
 
 Extraction may propose relations and dependencies only against the scoped list
 of current authoritative memories. Confirmation revalidates those IDs and
 writes the graph changes atomically. Confirming a `supersedes`/`contradicts`
 relation recursively marks the target's authoritative dependents
-`NEEDS_REVALIDATION`; they stop being retrieved until reviewed and confirmed
-again.
+`NEEDS_REVALIDATION`; they stay out of retrieval until explicitly revalidated
+through `lemn revalidate`. Ordinary `confirm` and
+`sweep --apply` cannot restore them. Revalidation requires an evidence note or
+explicit user confirmation, and any retained dependencies must still be
+authoritative; stale dependencies must be replaced or cleared.
 
 Automatic promotion is deliberately narrow, and it is the **extraction model's
 own call** that the daemon rubber-stamps: the daemon applies thresholds to the
@@ -476,6 +482,9 @@ Then promote and retrieve it:
 ```bash
 docker compose exec daemon lemn pending
 docker compose exec daemon lemn confirm <id>
+
+# For a dependent memory marked NEEDS_REVALIDATION:
+docker compose exec daemon lemn revalidate --evidence "Current API spec confirms this claim" <id>
 
 curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $SECRET" \
   -H 'Content-Type: application/json' \
@@ -1035,6 +1044,7 @@ export LEMN_POSTGRES_DSN="postgres://lemn:CHANGE_ME@localhost:5432/lemn_kernel?s
 |---|---|
 | `./bin/lemn pending` | Lists `OBSERVED`, legacy `CANDIDATE`, pending, and `NEEDS_REVALIDATION` memories with proposed relations and dependencies |
 | `./bin/lemn confirm <id> [options]` | Promotes a reviewed memory; supports `--relation`, `--target`, `--depends-on id,id`, and `--clear-dependencies` to correct proposals before atomic validation and application |
+| `./bin/lemn revalidate [--evidence note \| --user-confirmed] [--summary text] [--depends-on id,id \| --clear-dependencies] <id>` | Restores a quarantined dependent only with fresh evidence or explicit confirmation; records an audit entry, verifies dependencies, and can revise the claim or its dependency set |
 | `./bin/lemn reject <id>` | Marks a reviewable memory `REJECTED`, leaving current authoritative memories in place |
 | `./bin/labeler` | Interactive review of unlabelled turns from the SQLite queue |
 | `./bin/export` | Writes reviewed turns to `data/train.jsonl` and `data/valid.jsonl` |
@@ -1119,7 +1129,7 @@ If you are not comfortable using software developed with significant AI assistan
 ## Notes
 
 - The daemon uses SQLite for its durable queue and PostgreSQL for the kernel.
-- Pi does not have its own memory admin commands; use `lemn pending`, `confirm`, and `reject`.
+- Pi does not have its own memory admin commands; use `lemn pending`, `confirm`, `revalidate`, and `reject`.
 - The router and daemon expect OpenAI-compatible HTTP endpoints.
 - `/log` returns `202` as soon as the turn is queued. Everything after that —
   gating, extraction, embedding, kernel routing — happens in a background

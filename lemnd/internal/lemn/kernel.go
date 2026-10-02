@@ -6,11 +6,21 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
+	"time"
 )
 
 type ConfirmationDecision struct {
 	Relation            string
 	TargetID            int
+	DependsOn           []int
+	ReplaceDependencies bool
+}
+
+type RevalidationDecision struct {
+	Evidence            string
+	UserConfirmed       bool
+	Summary             string
 	DependsOn           []int
 	ReplaceDependencies bool
 }
@@ -109,7 +119,9 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 		return fmt.Errorf("failed to fetch pending memory #%d: %w", pendingID, err)
 	}
 	switch state {
-	case "OBSERVED", "CANDIDATE", "PENDING", "PENDING_CONFIRMATION", "NEEDS_REVALIDATION":
+	case "NEEDS_REVALIDATION":
+		return fmt.Errorf("memory #%d requires explicit revalidation before confirmation", pendingID)
+	case "OBSERVED", "CANDIDATE", "PENDING", "PENDING_CONFIRMATION":
 	default:
 		return fmt.Errorf("memory #%d is not awaiting review (state=%s)", pendingID, state)
 	}
@@ -215,14 +227,24 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 		if _, err := tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, pendingID, targetID, relation); err != nil {
 			return fmt.Errorf("failed to write %s edge: %w", relation, err)
 		}
+		revalidationReason := "dependency_superseded"
+		if relation == "contradicts" {
+			revalidationReason = "dependency_contradicted"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			WITH RECURSIVE affected(id) AS (
 				SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on'
 				UNION
 				SELECT e.source_id FROM lemn_edges e JOIN affected a ON e.target_id = a.id WHERE e.relationship = 'depends_on'
 			)
-			UPDATE lemn_memories SET state = 'NEEDS_REVALIDATION'
-			WHERE state = 'AUTHORITATIVE' AND id IN (SELECT id FROM affected)`, targetID); err != nil {
+			UPDATE lemn_memories
+			SET state = 'NEEDS_REVALIDATION',
+			    provenance = COALESCE(provenance, '{}'::jsonb) || jsonb_build_object(
+			        'revalidation_reason', $2::text,
+			        'invalidated_by_memory_id', $3::int,
+			        'invalidated_dependency_id', $1
+			    )
+			WHERE state = 'AUTHORITATIVE' AND id IN (SELECT id FROM affected)`, targetID, revalidationReason, pendingID); err != nil {
 			return fmt.Errorf("failed to flag dependent memories for revalidation: %w", err)
 		}
 	}
@@ -239,6 +261,165 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 	}
 
 	return tx.Commit()
+}
+
+// RevalidateMemory restores a quarantined memory only after fresh evidence or
+// explicit user confirmation, while preserving its established relations.
+func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision RevalidationDecision) error {
+	evidence := strings.TrimSpace(decision.Evidence)
+	if evidence == "" && !decision.UserConfirmed {
+		return fmt.Errorf("revalidation requires an evidence note or explicit user confirmation")
+	}
+
+	newSummary := strings.TrimSpace(decision.Summary)
+	var embeddingJSON []byte
+	if newSummary != "" {
+		embedding, err := getEmbedding(ctx, newSummary)
+		if err != nil {
+			return fmt.Errorf("failed to embed revised memory summary: %w", err)
+		}
+		embeddingJSON, err = json.Marshal(embedding)
+		if err != nil {
+			return fmt.Errorf("failed to encode revised memory embedding: %w", err)
+		}
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin revalidation: %w", err)
+	}
+	defer tx.Rollback()
+
+	var state, projectID, oldSummary string
+	var provenanceJSON []byte
+	if err := tx.QueryRowContext(ctx, `
+		SELECT state, project_id, summary, provenance
+		FROM lemn_memories WHERE id = $1 FOR UPDATE`, memoryID,
+	).Scan(&state, &projectID, &oldSummary, &provenanceJSON); err != nil {
+		return fmt.Errorf("failed to fetch memory #%d for revalidation: %w", memoryID, err)
+	}
+	if state != "NEEDS_REVALIDATION" {
+		return fmt.Errorf("memory #%d is not awaiting revalidation (state=%s)", memoryID, state)
+	}
+
+	dependencies := append([]int(nil), decision.DependsOn...)
+	if !decision.ReplaceDependencies {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT target_id FROM lemn_edges
+			WHERE source_id = $1 AND relationship = 'depends_on'
+			ORDER BY target_id`, memoryID)
+		if err != nil {
+			return fmt.Errorf("failed to load dependencies for memory #%d: %w", memoryID, err)
+		}
+		for rows.Next() {
+			var dependencyID int
+			if err := rows.Scan(&dependencyID); err != nil {
+				rows.Close()
+				return fmt.Errorf("failed to read dependencies for memory #%d: %w", memoryID, err)
+			}
+			dependencies = append(dependencies, dependencyID)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("failed to iterate dependencies for memory #%d: %w", memoryID, err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("failed to close dependencies for memory #%d: %w", memoryID, err)
+		}
+	} else {
+		dependencies = uniqueSortedIDs(dependencies)
+		if _, err := tx.ExecContext(ctx, `DELETE FROM lemn_edges WHERE source_id = $1 AND relationship = 'depends_on'`, memoryID); err != nil {
+			return fmt.Errorf("failed to replace dependencies for memory #%d: %w", memoryID, err)
+		}
+	}
+
+	dependencies = uniqueSortedIDs(dependencies)
+	for _, dependencyID := range dependencies {
+		if dependencyID <= 0 || dependencyID == memoryID {
+			return fmt.Errorf("invalid dependency id %d for memory #%d", dependencyID, memoryID)
+		}
+		var dependencyState, dependencyScope string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT state, project_id FROM lemn_memories WHERE id = $1 FOR UPDATE`, dependencyID,
+		).Scan(&dependencyState, &dependencyScope); err != nil {
+			return fmt.Errorf("failed to lock dependency #%d: %w", dependencyID, err)
+		}
+		if dependencyState != "AUTHORITATIVE" || !dependencyVisible(dependencyScope, projectID) {
+			return fmt.Errorf("dependency #%d is not authoritative and visible in scope %q", dependencyID, projectID)
+		}
+		if decision.ReplaceDependencies {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO lemn_edges (source_id, target_id, relationship)
+				VALUES ($1, $2, 'depends_on') ON CONFLICT DO NOTHING`, memoryID, dependencyID); err != nil {
+				return fmt.Errorf("failed to add dependency edge to #%d: %w", dependencyID, err)
+			}
+		}
+	}
+
+	var provenance map[string]interface{}
+	if len(provenanceJSON) > 0 {
+		if err := json.Unmarshal(provenanceJSON, &provenance); err != nil {
+			return fmt.Errorf("failed to parse provenance for #%d: %w", memoryID, err)
+		}
+	}
+	if provenance == nil {
+		provenance = make(map[string]interface{})
+	}
+	entry := map[string]interface{}{
+		"revalidated_at": time.Now().UTC().Format(time.RFC3339Nano),
+		"user_confirmed": decision.UserConfirmed,
+		"evidence_note":  evidence,
+	}
+	if reason, ok := provenance["revalidation_reason"]; ok {
+		entry["reason"] = reason
+	}
+	if invalidatedBy, ok := provenance["invalidated_by_memory_id"]; ok {
+		entry["invalidated_by_memory_id"] = invalidatedBy
+	}
+	if invalidatedDependency, ok := provenance["invalidated_dependency_id"]; ok {
+		entry["invalidated_dependency_id"] = invalidatedDependency
+	}
+	if newSummary != "" && newSummary != oldSummary {
+		entry["previous_summary"] = oldSummary
+		entry["revised_summary"] = newSummary
+	}
+	history, _ := provenance["revalidation_history"].([]interface{})
+	provenance["revalidation_history"] = append(history, entry)
+	provenance["depends_on"] = dependencies
+	delete(provenance, "revalidation_reason")
+	delete(provenance, "invalidated_by_memory_id")
+	delete(provenance, "invalidated_dependency_id")
+	updatedProvenance, err := json.Marshal(provenance)
+	if err != nil {
+		return fmt.Errorf("failed to encode revalidation provenance for #%d: %w", memoryID, err)
+	}
+
+	if len(embeddingJSON) > 0 {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE lemn_memories SET state = 'AUTHORITATIVE', summary = $1, embedding = $2::vector, provenance = $3
+			WHERE id = $4`, newSummary, string(embeddingJSON), updatedProvenance, memoryID)
+	} else {
+		_, err = tx.ExecContext(ctx, `
+			UPDATE lemn_memories SET state = 'AUTHORITATIVE', provenance = $1 WHERE id = $2`, updatedProvenance, memoryID)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to restore revalidated memory #%d: %w", memoryID, err)
+	}
+	return tx.Commit()
+}
+
+func uniqueSortedIDs(ids []int) []int {
+	seen := make(map[int]struct{}, len(ids))
+	unique := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	sort.Ints(unique)
+	return unique
 }
 
 func jsonInt(value interface{}) int {
