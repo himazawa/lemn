@@ -129,7 +129,7 @@ func listPending(db *sql.DB) {
 		if len(provenanceJSON) > 0 {
 			var prov map[string]interface{}
 			json.Unmarshal(provenanceJSON, &prov)
-			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "revalidation_history"} {
+			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "invalidated_at", "revalidation_history"} {
 				if value, ok := prov[key]; ok {
 					encoded, _ := json.Marshal(value)
 					fmt.Printf("      %s: %s\n", key, encoded)
