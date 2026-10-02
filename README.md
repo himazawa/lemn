@@ -888,9 +888,12 @@ to rerun only preference capture and transient-instruction rejection.
 The report separates **gate** precision/recall from **final memory**
 precision/recall, and includes extractor vetoes, summary term checks, global
 scope checks, relation checks, and descriptive evidence/target cosine
-distributions. It writes detailed per-case extraction and created-memory
-provenance to `write-results.json`. These are hand-labeled examples, so treat
-the scores as diagnostics rather than a calibrated quality estimate.
+distributions. `saved_scope_passed` and `saved_scope_checked` count only cases
+that created an actual memory row; the general scope counters also include
+cases rejected earlier by the gate or extractor. It writes detailed per-case
+extraction and created-memory provenance to `write-results.json`. These are
+hand-labeled examples, so treat the scores as diagnostics rather than a
+calibrated quality estimate.
 
 The latest contamination-free run on 2026-10-03 scored 20 cases three times
 each (60 turns). **Each trial used its own newly created Postgres database and
@@ -915,13 +918,14 @@ durable preferences expressed with "whatever repo", "regardless of repo",
 "any repo", and "all my future projects". Treat this as a narrow, explicitly
 worded path, not proof that arbitrary preference phrasing is handled.
 
-A focused real-write-path follow-up ran those four paraphrases alongside a
-saved project-local preference and a transient instruction, three fresh-scope
-trials each. All 15 expected durable saves were retained, all 3 temporary
-instructions were vetoed, and all 18 global/project scope labels matched with
-identical decisions across repeats. This is still a small synthetic set; the
-raw classifier missed the durable preferences, so the observed improvement is
-from the explicit cue override rather than Laya calibration.
+A balanced real-write-path follow-up ran those four paraphrases, a saved
+project-local preference, two durable cross-project technical decisions, and a
+transient instruction, three fresh-scope trials each. All 21 expected durable
+memories were saved, all 3 temporary instructions were vetoed, and all 21
+persisted global/project scope labels matched. Decisions were identical across
+repeats. This is still a small synthetic set; the raw classifier missed the
+durable preferences, so the observed improvement is from the explicit cue
+override rather than Laya calibration.
 
 Cosine thresholds were unchanged. Across this run, evidence cosine was
 `0.784`–`0.861` in 9 observations and target similarity was `0.880`–`0.908` in 6

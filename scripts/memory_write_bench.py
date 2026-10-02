@@ -183,12 +183,11 @@ def cleanup_memories(scopes: dict[str, str], database: str) -> None:
         raise RuntimeError(f"write-benchmark cleanup left rows in scopes {list(scopes.values())}: {remaining}")
 
 
-def read_created_memories(scope: str, turn_id: str, database: str) -> list[dict[str, Any]]:
+def read_created_memories(turn_id: str, database: str) -> list[dict[str, Any]]:
     query = (
         "SELECT COALESCE(json_agg(json_build_object('id', id, 'state', state, 'summary', summary, "
         "'confidence', confidence, 'provenance', provenance)), '[]'::json)::text "
-        f"FROM lemn_memories WHERE project_id = {sql_literal(scope)} "
-        f"AND provenance->>'source_turn_id' = {sql_literal(turn_id)};"
+        f"FROM lemn_memories WHERE provenance->>'source_turn_id' = {sql_literal(turn_id)};"
     )
     result = run_psql(query, database=database)
     return json.loads(result[0]) if result else []
@@ -257,6 +256,7 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
     summary_checked = summary_passed = 0
     relation_checked = relation_passed = 0
     global_checked = global_passed = 0
+    saved_scope_checked = saved_scope_passed = 0
     explicit_global_overrides = 0
     evidence_scores: list[float] = []
     target_scores: list[float] = []
@@ -300,6 +300,9 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
         if "expected_global_scoped" in case:
             global_checked += 1
             global_passed += int(bool(extraction.get("global_scoped")) == case["expected_global_scoped"])
+            if row.get("created_memories"):
+                saved_scope_checked += 1
+                saved_scope_passed += int(bool(extraction.get("global_scoped")) == case["expected_global_scoped"])
         for memory in row.get("created_memories", []):
             signals = memory.get("provenance", {}).get("signals", {})
             if isinstance(signals.get("evidence_similarity"), (int, float)):
@@ -360,6 +363,7 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
         "summary_terms_passed": summary_passed, "summary_terms_checked": summary_checked,
         "relation_passed": relation_passed, "relation_checked": relation_checked,
         "global_scope_passed": global_passed, "global_scope_checked": global_checked,
+        "saved_scope_passed": saved_scope_passed, "saved_scope_checked": saved_scope_checked,
         "explicit_global_overrides": explicit_global_overrides,
         "evidence_cosine": score_distribution(evidence_scores),
         "target_cosine": score_distribution(target_scores),
@@ -407,7 +411,7 @@ def run_trial(
             print(f"{case['id']} repeat {repeat}: JOB FAILED: {job.get('error', job['status'])}")
             return result
         extraction = job.get("extraction") or {}
-        memories = read_created_memories(scope, turn_id, database)
+        memories = read_created_memories(turn_id, database)
         print(f"{case['id']} repeat {repeat}: memory_worthy={extraction.get('memory_worthy')} summary={extraction.get('summary', '')!r}")
         return {
             "case_id": case["id"],
