@@ -1,10 +1,14 @@
 # LEMN — Local Epistemic Memory Kernel + Laya Model Router
 
-LEMN is a small local system for two related jobs:
+LEMN is a local memory service for coding agents, plus an optional model router.
+Its memory kernel manages the lifecycle of candidate facts: worthiness gating,
+extraction, evidence and relation checks, review or promotion, scoped retrieval,
+and supersession/revalidation. It is intended to help agents carry useful,
+corrected project knowledge across sessions; the current benchmarks are
+synthetic functional checks, not evidence of reliable long-term benefit on
+real-world projects.
 
-1. route chat requests to a fast or heavy model
-2. decide which turns are worth storing as long-term memory
-
+The optional router independently sends chat requests to a fast or heavy model.
 Everything runs on your machine. Nothing leaves it.
 
 It uses:
@@ -275,13 +279,20 @@ Only `AUTHORITATIVE` memories are ever retrieved. That is the whole point of the
 state machine: nothing reaches your prompt until it has either earned automatic
 promotion or been confirmed by you.
 
-## Why This Helps Long-Horizon Use
+## Long-Horizon Goal
 
-LEMN is useful when the conversation has to stay coherent across many turns, sessions, or even days.
+LEMN is designed for work that spans many turns or sessions. Unlike a flat
+append-only note store, it gives memories explicit states and provenance, scopes
+them by project, limits prompt injection to retrieved authoritative facts, and
+supports review, supersession, contradiction, and dependent-memory revalidation.
+The aim is to keep useful context available while making stale claims easier to
+replace and inspect.
 
-It helps because it does not treat memory as a single flat log. It separates raw turn capture, memory-worthiness gating, extraction, retrieval, and supersession, so the system can keep useful information while still replacing stale or duplicated memories over time.
-
-That matters for long-horizon work because the prompt only needs the current authoritative view of the user, the project, or the task. Older memories do not just pile up forever; they can be superseded, reviewed, or rejected.
+That is an architectural rationale, not yet a demonstrated long-horizon outcome.
+The current synthetic benchmarks exercise retrieval, scope isolation, staged
+updates, and the write pipeline on labeled examples. They do not establish that
+LEMN improves task success over a maintained `AGENTS.md` across real projects or
+long periods. Treat effectiveness as an open evaluation question.
 
 ## Compared With Other Memory Kernels
 
