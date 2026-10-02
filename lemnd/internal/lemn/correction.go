@@ -77,29 +77,76 @@ func findSimilarAuthoritative(ctx context.Context, db *sql.DB, embedding []float
 	return matches, nil
 }
 
-func ResolveTargetAndRoute(ctx context.Context, db *sql.DB, toolCalls []ToolCallEvidence, newMem MemoryNode) (int, error) {
-	candidateMatches, err := findSimilarAuthoritative(ctx, db, newMem.Embedding, supersedeThreshold(), newMem.ProjectID)
+// FindSimilarAuthoritative embeds a newly extracted summary and searches its scope.
+func FindSimilarAuthoritative(ctx context.Context, db *sql.DB, summary, scope string) ([]MatchTarget, []float32, error) {
+	embedding, err := getEmbedding(ctx, summary)
 	if err != nil {
-		return 0, fmt.Errorf("target search failed: %w", err)
+		return nil, nil, fmt.Errorf("embed relation query: %w", err)
 	}
-
-	if newMem.Provenance == nil {
-		newMem.Provenance = make(map[string]interface{})
-	}
-	newMem.Provenance["candidate_targets"] = candidateMatches
-
-	relevant, evidenceSource, err := hasRelevantEvidence(ctx, newMem, toolCalls)
+	matches, err := findSimilarAuthoritative(ctx, db, embedding, supersedeThreshold(), scope)
 	if err != nil {
-		return 0, fmt.Errorf("evidence check failed: %w", err)
+		return nil, nil, fmt.Errorf("search relation candidates: %w", err)
 	}
-	if relevant {
-		newMem.Provenance["evidence_source"] = evidenceSource
-	}
+	return matches, embedding, nil
+}
 
-	if relevant && len(candidateMatches) == 1 {
-		return SupersedeMemory(ctx, db, candidateMatches[0].ID, newMem)
+func ListDependencyCandidates(ctx context.Context, db *sql.DB, scope string, limit int) ([]DependencyCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
 	}
+	scope = NormalizeScope(scope)
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, project_id, summary
+		FROM lemn_memories
+		WHERE state = 'AUTHORITATIVE'
+		  AND (project_id = $1 OR ($1 <> 'global' AND project_id = 'global'))
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2`, scope, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list dependency candidates: %w", err)
+	}
+	defer rows.Close()
 
-	newMem.State = "PENDING_CONFIRMATION"
-	return insertMemory(ctx, db, newMem)
+	var candidates []DependencyCandidate
+	for rows.Next() {
+		var candidate DependencyCandidate
+		if err := rows.Scan(&candidate.ID, &candidate.ProjectID, &candidate.Summary); err != nil {
+			return nil, fmt.Errorf("scan dependency candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dependency candidates: %w", err)
+	}
+	return candidates, nil
+}
+
+func ListRelationCandidates(ctx context.Context, db *sql.DB, scope string, limit int) ([]DependencyCandidate, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	scope = NormalizeScope(scope)
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, project_id, summary
+		FROM lemn_memories
+		WHERE state = 'AUTHORITATIVE' AND project_id = $1
+		ORDER BY created_at DESC, id DESC
+		LIMIT $2`, scope, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list relation candidates: %w", err)
+	}
+	defer rows.Close()
+
+	var candidates []DependencyCandidate
+	for rows.Next() {
+		var candidate DependencyCandidate
+		if err := rows.Scan(&candidate.ID, &candidate.ProjectID, &candidate.Summary); err != nil {
+			return nil, fmt.Errorf("scan relation candidate: %w", err)
+		}
+		candidates = append(candidates, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate relation candidates: %w", err)
+	}
+	return candidates, nil
 }

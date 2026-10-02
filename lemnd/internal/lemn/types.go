@@ -14,15 +14,21 @@ type TurnPayload struct {
 }
 
 type ModelExtraction struct {
-	MemoryWorthy bool    `json:"memory_worthy"`
-	GlobalScoped bool    `json:"global_scoped"` // user-level preference rather than a project fact
-	Type         string  `json:"type"` // "decision", "architecture", "bug_fix", "none"
-	Summary      string  `json:"summary"`
-	Confidence   float64 `json:"confidence"` // 0.0 - 1.0
+	MemoryWorthy           bool          `json:"memory_worthy"`
+	GlobalScoped           bool          `json:"global_scoped"` // user-level preference rather than a project fact
+	Type                   string        `json:"type"`          // "decision", "architecture", "bug_fix", "none"
+	Summary                string        `json:"summary"`
+	Confidence             float64       `json:"confidence"`       // 0.0 - 1.0
+	GateProbability        float64       `json:"gate_probability"` // Laya's memory-worthiness probability
+	Relation               string        `json:"relation"`         // "independent", "supersedes", or "contradicts"
+	TargetID               int           `json:"target_id"`
+	DependsOn              []int         `json:"depends_on"`
+	DependencyCandidateIDs []int         `json:"-"`
+	RelationCandidates     []MatchTarget `json:"-"`
+	SummaryEmbedding       []float32     `json:"-"`
 }
 
 type MemoryNode struct {
-	ID         int                    `json:"id"`
 	State      string                 `json:"state"`
 	ProjectID  string                 `json:"project_id"`
 	Confidence float64                `json:"confidence"`
@@ -37,6 +43,12 @@ type MatchTarget struct {
 	ID         int     `json:"id"`
 	Summary    string  `json:"summary"`
 	Similarity float64 `json:"similarity"`
+}
+
+type DependencyCandidate struct {
+	ID        int    `json:"id"`
+	ProjectID string `json:"project_id"`
+	Summary   string `json:"summary"`
 }
 
 type CorrectionIntent struct {
@@ -56,4 +68,8 @@ type RetrievedMemory struct {
 	Category   string  `json:"category"`
 	Summary    string  `json:"summary"`
 	Similarity float64 `json:"similarity"`
+	// BelowThreshold is set when the near-miss fallback returned this memory:
+	// it is AUTHORITATIVE but did not clear the retrieval similarity bar for
+	// this query, so the prompt should present it as weaker context.
+	BelowThreshold bool `json:"below_threshold"`
 }

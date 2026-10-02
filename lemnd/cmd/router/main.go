@@ -18,9 +18,11 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -81,20 +83,27 @@ type classifyResponse struct {
 }
 
 var (
-	layaEndpoint    = getenv("LEMN_LAYA_URL", "http://localhost:8002/classify")
-	fastModelURL    = getenv("LEMN_FAST_MODEL_URL", "http://localhost:8010/v1/chat/completions")
-	heavyModelURL   = getenv("LEMN_HEAVY_MODEL_URL", "http://localhost:8011/v1/chat/completions")
-	fastModelName   = os.Getenv("LEMN_FAST_MODEL_NAME")
-	heavyModelName  = os.Getenv("LEMN_HEAVY_MODEL_NAME")
-	backendAPIKey   = os.Getenv("LEMN_BACKEND_API_KEY")
-	routerBind      = getenv("LEMN_ROUTER_BIND", "127.0.0.1:8090")
+	layaEndpoint   = getenv("LEMN_LAYA_URL", "http://localhost:8002/classify")
+	fastModelURL   = getenv("LEMN_FAST_MODEL_URL", "http://localhost:8010/v1/chat/completions")
+	heavyModelURL  = getenv("LEMN_HEAVY_MODEL_URL", "http://localhost:8011/v1/chat/completions")
+	fastModelName  = os.Getenv("LEMN_FAST_MODEL_NAME")
+	heavyModelName = os.Getenv("LEMN_HEAVY_MODEL_NAME")
+	backendAPIKey  = os.Getenv("LEMN_BACKEND_API_KEY")
+	routerBind     = getenv("LEMN_ROUTER_BIND", "127.0.0.1:8090")
 	// Laya is single-process and CPU-bound, so a classify can queue behind the
 	// daemon's memory-worthiness call. Too low here silently routes everything
 	// to the heavy model via the fail-open path.
 	classifyTimeout = getenvDuration("LEMN_CLASSIFY_TIMEOUT", 5*time.Second)
-	backendTimeout  = 5 * time.Minute // generous — this covers full generation, not just connect
-	sharedSecret    string
+	// Inactivity limit, not a total deadline: long generations on local models
+	// run well past any fixed cap. Must also cover prefill before the first byte.
+	backendIdleTimeout = getenvDuration("LEMN_BACKEND_IDLE_TIMEOUT", 25*time.Minute)
+	// Prompts above this go to heavy regardless of the classifier: the fast model's
+	// window is smaller, and a short follow-up deep in a task is not an easy task.
+	longContextTokens = getenvInt("LEMN_LONG_CONTEXT_TOKENS", 30000)
+	sharedSecret      string
 )
+
+var errBackendIdle = errors.New("backend idle timeout exceeded")
 
 // backend is the chosen destination. model is non-empty for servers that host
 // several models behind a single URL (oMLX), where the request body — not the
@@ -109,6 +118,15 @@ type backend struct {
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return def
+}
+
+func getenvInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return def
 }
@@ -162,7 +180,8 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	chosen := chooseBackend(lastUserMsg)
+	// ~3 bytes per token over-estimates for JSON-escaped code, erring toward heavy.
+	chosen := chooseBackend(lastUserMsg, len(bodyBytes)/3)
 	if chosen.model != "" {
 		rewritten, err := withModel(bodyBytes, chosen.model)
 		if err != nil {
@@ -172,8 +191,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), backendTimeout)
-	defer cancel()
+	ctx, cancel := context.WithCancelCause(r.Context())
+	defer cancel(nil)
+	idle := time.AfterFunc(backendIdleTimeout, func() { cancel(errBackendIdle) })
+	defer idle.Stop()
 
 	proxyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, chosen.url, bytes.NewReader(bodyBytes))
 	if err != nil {
@@ -187,7 +208,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := http.DefaultClient.Do(proxyReq)
 	if err != nil {
-		http.Error(w, "backend model request failed: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, "backend model request failed: "+context.Cause(ctx).Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -207,21 +228,56 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	// Flush after every write so streamed (SSE) completions reach Pi
-	// incrementally instead of being buffered until the backend finishes.
+	// Flush each SSE line and record whether the upstream completed its stream.
 	flusher, canFlush := w.(http.Flusher)
-	buf := make([]byte, 4096)
+	reader := bufio.NewReader(resp.Body)
+	isSSE := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+	var bytesWritten int64
+	sawFinishReason := false
+	sawDone := false
+	startedAt := time.Now()
 	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+		line, readErr := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			idle.Reset(backendIdleTimeout)
+			if _, writeErr := w.Write(line); writeErr != nil {
 				return
+			}
+			bytesWritten += int64(len(line))
+			if isSSE {
+				data := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data:")))
+				if bytes.Equal(data, []byte("[DONE]")) {
+					sawDone = true
+				} else {
+					var chunk struct {
+						Choices []struct {
+							FinishReason *string `json:"finish_reason"`
+						} `json:"choices"`
+					}
+					if json.Unmarshal(data, &chunk) == nil {
+						for _, choice := range chunk.Choices {
+							if choice.FinishReason != nil && *choice.FinishReason != "" {
+								sawFinishReason = true
+							}
+						}
+					}
+				}
 			}
 			if canFlush {
 				flusher.Flush()
 			}
 		}
 		if readErr != nil {
+			if cause := context.Cause(ctx); cause != nil {
+				readErr = cause
+			}
+			if isSSE && !sawFinishReason {
+				log.Printf("[Router] incomplete SSE from %s model=%q status=%d bytes=%d finish_reason=false done=%t duration=%s read_error=%v",
+					chosen.label, chosen.model, resp.StatusCode, bytesWritten, sawDone, time.Since(startedAt).Round(time.Millisecond), readErr)
+			} else if !errors.Is(readErr, io.EOF) {
+				log.Printf("[Router] upstream stream read failed from %s model=%q status=%d bytes=%d finish_reason=%t done=%t duration=%s error=%v",
+					chosen.label, chosen.model, resp.StatusCode, bytesWritten, sawFinishReason, sawDone, time.Since(startedAt).Round(time.Millisecond), readErr)
+			}
 			return
 		}
 	}
@@ -242,9 +298,14 @@ func withModel(body []byte, model string) ([]byte, error) {
 	return json.Marshal(raw)
 }
 
-func chooseBackend(userMessage string) backend {
+func chooseBackend(userMessage string, estTokens int) backend {
 	fast := backend{url: fastModelURL, model: fastModelName, label: "fast", prob: -1}
 	heavy := backend{url: heavyModelURL, model: heavyModelName, label: "heavy", prob: -1}
+
+	if estTokens > longContextTokens {
+		log.Printf("[Router] long context (~%d tokens > %d) -> heavy model", estTokens, longContextTokens)
+		return heavy
+	}
 
 	if userMessage == "" {
 		return heavy

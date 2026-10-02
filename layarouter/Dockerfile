@@ -8,7 +8,7 @@ COPY requirements.txt .
 # full CUDA stack (~9GB) that no container in this stack can use.
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch \
  && pip install --no-cache-dir -r requirements.txt
-COPY server.py .
+COPY server.py eval_memory_gate.py .
 ENV USE_TF=0 HF_HOME=/hf-cache
 RUN mkdir -p /hf-cache && chown laya:laya /hf-cache
 USER laya

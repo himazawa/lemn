@@ -223,7 +223,7 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 		return fmt.Errorf("corrupt job payload: %w", err)
 	}
 
-	extraction, err := runZeroShotExtraction(t)
+	extraction, err := runZeroShotExtraction(t, pgDB)
 	if err != nil {
 		return fmt.Errorf("extraction failed: %w", err)
 	}
@@ -258,7 +258,7 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 	return nil
 }
 
-func runZeroShotExtraction(t lemn.TurnPayload) (lemn.ModelExtraction, error) {
+func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtraction, error) {
 	memoryWorthy, probability, globallyApplicable, err := decideMemoryWorthiness(t)
 	if err != nil {
 		return lemn.ModelExtraction{}, err
@@ -271,14 +271,42 @@ func runZeroShotExtraction(t lemn.TurnPayload) (lemn.ModelExtraction, error) {
 		}, nil
 	}
 
+	scope := lemn.NormalizeScope(t.ProjectID)
+	if globallyApplicable {
+		scope = lemn.GlobalScope
+	}
+	var dependencyCandidates []lemn.DependencyCandidate
+	if pgDB != nil {
+		candidateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		dependencyCandidates, err = lemn.ListDependencyCandidates(candidateCtx, pgDB, scope, 40)
+		if err != nil {
+			return lemn.ModelExtraction{}, fmt.Errorf("dependency candidate lookup failed: %w", err)
+		}
+	}
+	dependencyJSON, _ := json.Marshal(dependencyCandidates)
+	dependencyIDs := make([]int, len(dependencyCandidates))
+	for i, candidate := range dependencyCandidates {
+		dependencyIDs[i] = candidate.ID
+	}
 	prompt := fmt.Sprintf(`Analyze this software engineering conversation turn.
 User: %s
 Assistant: %s
 
 Respond ONLY with JSON matching this format:
 
-{"type": "decision|architecture|bug_fix|none", "summary": "brief summary", "confidence": 0.0-1.0}`,
-		t.UserMessage, t.AssistantResponse)
+{"type": "decision|architecture|bug_fix|none", "summary": "brief summary", "confidence": 0.0-1.0, "depends_on": []}
+
+- depends_on may contain only IDs from the dependency candidate list, and only when this new claim relies on them remaining true. Do not infer dependencies from topical similarity.
+
+Summary rules:
+- State the durable fact itself (e.g. "The router uses a 25m idle timeout"), not what happened in the turn.
+- Use type none when the turn only describes the conversation (what the assistant explained, outlined or answered) or confirms memory IDs, without a new fact about the project or user.
+
+Memory scope for this claim: %s
+Authoritative memories eligible as dependencies (same scope or global):
+%s`,
+		t.UserMessage, t.AssistantResponse, scope, string(dependencyJSON))
 
 	reqBody, _ := json.Marshal(map[string]any{
 		"model": getenv("LEMN_EXTRACTION_MODEL", "qwen2.5-coder"),
@@ -326,6 +354,7 @@ Respond ONLY with JSON matching this format:
 		Type       string  `json:"type"`
 		Summary    string  `json:"summary"`
 		Confidence float64 `json:"confidence"`
+		DependsOn  []int   `json:"depends_on"`
 	}
 	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), &payload); err != nil {
 		return lemn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
@@ -333,7 +362,7 @@ Respond ONLY with JSON matching this format:
 
 	// Type "none" is the extraction model's own veto: Laya thought the turn
 	// was worth a look, but there was no durable claim in it to store.
-	if payload.Type == "" || payload.Type == "none" {
+	if payload.Type == "" || payload.Type == "none" || lemn.IsMetaSummary(payload.Summary) {
 		return lemn.ModelExtraction{
 			MemoryWorthy: false,
 			Type:         "none",
@@ -341,13 +370,126 @@ Respond ONLY with JSON matching this format:
 		}, nil
 	}
 
+	relation := "independent"
+	targetID := 0
+	relationCandidates := make([]lemn.MatchTarget, 0)
+	var summaryEmbedding []float32
+	if pgDB != nil {
+		searchCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		relationCandidates, summaryEmbedding, err = lemn.FindSimilarAuthoritative(searchCtx, pgDB, payload.Summary, scope)
+		cancel()
+		if err != nil {
+			return lemn.ModelExtraction{}, fmt.Errorf("relation target search failed: %w", err)
+		}
+		if relationCandidates == nil {
+			relationCandidates = make([]lemn.MatchTarget, 0)
+		}
+		if len(relationCandidates) > 0 {
+			relation, targetID, err = classifyRelation(t, payload.Summary, relationCandidates)
+			if err != nil {
+				log.Printf("[Extraction] relation classification failed for turn %s; treating as independent: %v", t.ID, err)
+				relation, targetID = "independent", 0
+			}
+		}
+	}
 	return lemn.ModelExtraction{
-		MemoryWorthy: true,
-		GlobalScoped: globallyApplicable,
-		Type:         payload.Type,
-		Summary:      payload.Summary,
-		Confidence:   payload.Confidence,
+		MemoryWorthy:           true,
+		GlobalScoped:           globallyApplicable,
+		Type:                   payload.Type,
+		Summary:                payload.Summary,
+		Confidence:             payload.Confidence,
+		GateProbability:        probability,
+		Relation:               relation,
+		TargetID:               targetID,
+		DependsOn:              payload.DependsOn,
+		DependencyCandidateIDs: dependencyIDs,
+		RelationCandidates:     relationCandidates,
+		SummaryEmbedding:       summaryEmbedding,
 	}, nil
+}
+
+func classifyRelation(t lemn.TurnPayload, summary string, candidates []lemn.MatchTarget) (string, int, error) {
+	candidatesJSON, err := json.Marshal(candidates)
+	if err != nil {
+		return "independent", 0, fmt.Errorf("encode relation candidates: %w", err)
+	}
+	prompt := fmt.Sprintf(`Decide whether this newly extracted fact changes an existing authoritative fact.
+
+New fact: %s
+Turn context:
+User: %s
+Assistant: %s
+
+Choose independent unless the turn clearly changes or rejects one candidate.
+Use supersedes when the new fact replaces an older or no-longer-current fact.
+Use contradicts only when the turn establishes that a candidate was false.
+Related topic alone is not enough. If none matches, choose independent and target_id 0.
+If choosing a relation, target_id must be one of the candidate IDs below.
+
+Candidates:
+%s
+
+Respond only as JSON: {"relation":"independent|supersedes|contradicts","target_id":0}`,
+		summary, t.UserMessage, t.AssistantResponse, string(candidatesJSON))
+
+	body, _ := json.Marshal(map[string]any{
+		"model":           getenv("LEMN_EXTRACTION_MODEL", "qwen2.5-coder"),
+		"messages":        []map[string]string{{"role": "user", "content": prompt}},
+		"response_format": map[string]string{"type": "json_object"},
+	})
+	request, err := http.NewRequest(http.MethodPost, getenv("LEMN_EXTRACTION_URL", "http://localhost:8000/v1/chat/completions"), bytes.NewBuffer(body))
+	if err != nil {
+		return "independent", 0, fmt.Errorf("build relation request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if key := os.Getenv("LEMN_BACKEND_API_KEY"); key != "" {
+		request.Header.Set("Authorization", "Bearer "+key)
+	}
+	client := http.Client{Timeout: getenvDuration("LEMN_EXTRACTION_TIMEOUT", 120*time.Second)}
+	response, err := client.Do(request)
+	if err != nil {
+		return "independent", 0, fmt.Errorf("relation request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "independent", 0, fmt.Errorf("relation API returned status %d", response.StatusCode)
+	}
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return "independent", 0, fmt.Errorf("decode relation response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return "independent", 0, fmt.Errorf("empty relation choices")
+	}
+	var choice struct {
+		Relation string `json:"relation"`
+		TargetID int    `json:"target_id"`
+	}
+	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), &choice); err != nil {
+		return "independent", 0, fmt.Errorf("invalid relation JSON: %w", err)
+	}
+	return validateRelationChoice(choice.Relation, choice.TargetID, candidates)
+}
+
+func validateRelationChoice(relation string, targetID int, candidates []lemn.MatchTarget) (string, int, error) {
+	if relation == "independent" {
+		return "independent", 0, nil
+	}
+	if relation != "supersedes" && relation != "contradicts" {
+		return "independent", 0, nil
+	}
+	for _, candidate := range candidates {
+		if candidate.ID == targetID {
+			return relation, targetID, nil
+		}
+	}
+	return "independent", 0, nil
 }
 
 // Returns memory-worthiness, its probability, and whether the turn is a

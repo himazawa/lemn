@@ -34,8 +34,12 @@ import laya
 
 MODEL_REPO = os.environ.get("LAYA_MODEL_REPO", "convaiinnovations/laya-typed-decisions")
 THRESHOLD = float(os.environ.get("LAYA_ROUTING_THRESHOLD", "0.38"))
-MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.5"))
+# Calibrated as a pair with the memory_worthy wording below (see
+# eval_memory_gate.py): on the labelled set the wording separates the classes
+# at ~0.45, so the default sits at the measured midpoint, not at 0.5.
+MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.45"))
 GLOBAL_THRESHOLD = float(os.environ.get("LAYA_GLOBAL_THRESHOLD", "0.67"))
+CORRECTION_THRESHOLD = float(os.environ.get("LAYA_CORRECTION_THRESHOLD", "0.5"))
 
 SHARED_SECRET = os.environ.get("LEMN_SHARED_SECRET")
 if not SHARED_SECRET:
@@ -80,13 +84,19 @@ ROUTING_QUESTIONS = {
 MEMORY_QUESTIONS = {
     "memory_worthy": {
         "type": "noul",
+        # Chosen by measurement (eval_memory_gate.py) over a labelled set of
+        # real traffic. The previous abstract wording ("stable, reusable
+        # information ... likely to matter") left the worth and transient
+        # classes overlapping (separation -0.158); this concrete, contrastive
+        # phrasing — and its 0.45 threshold, as a pair — separates them
+        # (11/12 correct; the one miss is an acknowledgement that the
+        # extraction layer vetoes). Run eval_memory_gate.py --assert after
+        # any change here.
         "instructions": (
-            "Should this conversation turn be stored as durable memory for "
-            "future retrieval because it contains stable, reusable "
-            "information such as a preference, fact, decision, constraint, "
-            "correction, recurring goal, or other detail likely to matter "
-            "in future conversations as opposed to a transient request, a "
-            "routine exchange, or short-lived context?"
+            "Does this turn establish or change something concrete — a "
+            "decision made, a fact confirmed, a preference stated, a mistake "
+            "corrected, a configuration set — as opposed to merely requesting "
+            "information or acknowledging a previous answer?"
         ),
     },
     "globally_applicable": {
@@ -99,6 +109,19 @@ MEMORY_QUESTIONS = {
             "Would this statement still be completely true and useful if the "
             "current project were deleted and the user started an entirely "
             "unrelated new project from scratch?"
+        ),
+    },
+    "is_correction": {
+        "type": "noul",
+        # Primary detector for turns that correct, replace, or reject something
+        # stated earlier. The daemon also keeps a phrasing backstop (regex) and
+        # ORs the two: the regex misses past tense and implicit corrections,
+        # Laya misses nothing it can't see, and a false positive only costs one
+        # review-queue item. Starting threshold; calibrate on labelled traffic
+        # like the other questions, remembering the probabilities are compressed.
+        "instructions": (
+            "Is the user correcting, replacing, or rejecting something that was "
+            "previously claimed, decided, configured, or preferred?"
         ),
     },
 }
@@ -126,6 +149,9 @@ class MemoryWorthinessResponse(BaseModel):
     globally_applicable: bool
     global_probability: float
     global_threshold: float
+    is_correction: bool
+    correction_probability: float
+    correction_threshold: float
 
 
 def _noul(result: dict, question: str) -> float:
@@ -159,6 +185,7 @@ def memory_worthiness(req: MemoryWorthinessRequest) -> MemoryWorthinessResponse:
     result = agent.predict(state, MEMORY_QUESTIONS)
     probability = _noul(result, "memory_worthy")
     global_probability = _noul(result, "globally_applicable")
+    correction_probability = _noul(result, "is_correction")
     return MemoryWorthinessResponse(
         memory_worthy=probability >= MEMORY_THRESHOLD,
         probability=probability,
@@ -166,6 +193,9 @@ def memory_worthiness(req: MemoryWorthinessRequest) -> MemoryWorthinessResponse:
         globally_applicable=global_probability >= GLOBAL_THRESHOLD,
         global_probability=global_probability,
         global_threshold=GLOBAL_THRESHOLD,
+        is_correction=correction_probability >= CORRECTION_THRESHOLD,
+        correction_probability=correction_probability,
+        correction_threshold=CORRECTION_THRESHOLD,
     )
 
 
@@ -177,4 +207,5 @@ def healthz():
         "routing_threshold": THRESHOLD,
         "memory_threshold": MEMORY_THRESHOLD,
         "global_threshold": GLOBAL_THRESHOLD,
+        "correction_threshold": CORRECTION_THRESHOLD,
     }

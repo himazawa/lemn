@@ -8,6 +8,11 @@ import { basename } from "node:path";
 const LEMN_SHARED_SECRET = process.env.LEMN_SHARED_SECRET || "";
 const DAEMON_URL = process.env.LEMN_DAEMON_URL || "http://localhost:8080";
 
+// How many memories to inject per turn. Every injected memory is carried in
+// every subsequent prompt, so raise this deliberately — the daemon will
+// return more, but the prompt pays for it.
+const RETRIEVAL_LIMIT = Math.max(1, parseInt(process.env.LEMN_RETRIEVAL_LIMIT || "5", 10) || 5);
+
 // Memories are scoped to this id; "global" ones are visible from every project.
 // Resolved once at load from the git root, so worktrees of the same repo share
 // a scope and a plain directory still gets a stable name.
@@ -83,7 +88,7 @@ export default function lemnExtension(pi: ExtensionAPI) {
         body: JSON.stringify({
           query: event.prompt,
           project_id: PROJECT_ID,
-          limit: 5
+          limit: RETRIEVAL_LIMIT
         })
       });
       if (!response.ok) return;

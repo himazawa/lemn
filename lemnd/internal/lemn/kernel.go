@@ -5,18 +5,38 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 )
+
+type ConfirmationDecision struct {
+	Relation            string
+	TargetID            int
+	DependsOn           []int
+	ReplaceDependencies bool
+}
 
 const evidenceRelevanceThreshold = 0.60
 
-func hasRelevantEvidence(ctx context.Context, mem MemoryNode, toolCalls []ToolCallEvidence) (bool, string, error) {
+type evidenceSignal struct {
+	Relevant   bool
+	Similarity float64 // best claim-vs-tool-output cosine, kept even below threshold for tuning
+	Tool       string
+}
+
+// measureEvidence scans every tool call rather than stopping at the first
+// match, so the logged similarity is the true best.
+func measureEvidence(ctx context.Context, mem MemoryNode, toolCalls []ToolCallEvidence) (evidenceSignal, error) {
+	var sig evidenceSignal
 	if len(toolCalls) == 0 {
-		return false, "", nil
+		return sig, nil
 	}
 
-	claimEmbedding, err := getEmbedding(ctx, mem.Summary)
-	if err != nil {
-		return false, "", fmt.Errorf("failed to embed claim for evidence check: %w", err)
+	claimEmbedding := mem.Embedding
+	if len(claimEmbedding) == 0 {
+		var err error
+		if claimEmbedding, err = getEmbedding(ctx, mem.Summary); err != nil {
+			return sig, fmt.Errorf("failed to embed claim for evidence check: %w", err)
+		}
 	}
 
 	for _, tc := range toolCalls {
@@ -27,90 +47,12 @@ func hasRelevantEvidence(ctx context.Context, mem MemoryNode, toolCalls []ToolCa
 		if err != nil {
 			continue
 		}
-		if cosineSimilarity(claimEmbedding, diffEmbedding) >= evidenceRelevanceThreshold {
-			return true, tc.Name, nil
+		if s := cosineSimilarity(claimEmbedding, diffEmbedding); s > sig.Similarity {
+			sig.Similarity, sig.Tool = s, tc.Name
 		}
 	}
-	return false, "", nil
-}
-
-func PromoteStandardMemory(ctx context.Context, db *sql.DB, mem MemoryNode, toolCalls []ToolCallEvidence) (int, error) {
-	relevant, evidenceSource, err := hasRelevantEvidence(ctx, mem, toolCalls)
-	if err != nil {
-		return 0, fmt.Errorf("evidence check failed: %w", err)
-	}
-
-	candidateMatches, err := findSimilarAuthoritative(ctx, db, mem.Embedding, supersedeThreshold(), mem.ProjectID)
-	if err != nil {
-		return 0, fmt.Errorf("similarity search failed: %w", err)
-	}
-
-	if mem.Provenance == nil {
-		mem.Provenance = make(map[string]interface{})
-	}
-	mem.Provenance["candidate_targets"] = candidateMatches
-	if relevant {
-		mem.Provenance["evidence_source"] = evidenceSource
-	}
-
-	switch {
-	case relevant && len(candidateMatches) == 1:
-		return SupersedeMemory(ctx, db, candidateMatches[0].ID, mem)
-	case relevant && len(candidateMatches) == 0:
-		mem.State = "AUTHORITATIVE"
-		return insertMemory(ctx, db, mem)
-	default:
-		if mem.State == "" {
-			mem.State = "CANDIDATE"
-		}
-		return insertMemory(ctx, db, mem)
-	}
-}
-
-// SupersedeMemory inserts a brand-new AUTHORITATIVE memory and marks an
-// existing one SUPERSEDED. Used by the automatic write path, where the
-// new memory doesn't exist as a row yet. NOT used for confirming an
-// already-inserted PENDING row — see ConfirmPendingMemory below, which
-// promotes that row in place instead of inserting a duplicate.
-func SupersedeMemory(ctx context.Context, db *sql.DB, oldID int, newMem MemoryNode) (int, error) {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var newID int
-	provenanceJSON, _ := json.Marshal(newMem.Provenance)
-	embeddingJSON, _ := json.Marshal(newMem.Embedding)
-
-	err = tx.QueryRowContext(ctx, `
-		INSERT INTO lemn_memories (state, project_id, confidence, category, summary, rationale, embedding, provenance)
-		VALUES ('AUTHORITATIVE', $1, $2, $3, $4, $5, $6, $7)
-		RETURNING id;`,
-		NormalizeScope(newMem.ProjectID), newMem.Confidence, newMem.Category, newMem.Summary, newMem.Rationale, string(embeddingJSON), provenanceJSON,
-	).Scan(&newID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to insert new authoritative memory: %w", err)
-	}
-
-	if _, err = tx.ExecContext(ctx, `UPDATE lemn_memories SET state = 'SUPERSEDED' WHERE id = $1`, oldID); err != nil {
-		return 0, fmt.Errorf("failed to mark old memory superseded: %w", err)
-	}
-
-	if _, err = tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'supersedes')`, newID, oldID); err != nil {
-		return 0, fmt.Errorf("failed to write supersedes edge: %w", err)
-	}
-
-	if _, err = tx.ExecContext(ctx, `
-		UPDATE lemn_memories SET state = 'NEEDS_REVALIDATION'
-		WHERE id IN (SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on')`, oldID); err != nil {
-		return 0, fmt.Errorf("failed to invalidate dependent nodes: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("transaction commit failed: %w", err)
-	}
-	return newID, nil
+	sig.Relevant = sig.Similarity >= evidenceRelevanceThreshold
+	return sig, nil
 }
 
 func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) {
@@ -127,30 +69,27 @@ func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) 
 	return id, err
 }
 
-// ConfirmPendingMemory promotes an existing PENDING or PENDING_CONFIRMATION
-// row to AUTHORITATIVE in place. If its provenance names exactly one
-// candidate target (from an earlier ambiguous or conversational
-// correction), that target is atomically marked SUPERSEDED, linked via a
-// 'supersedes' edge, and its dependents flagged NEEDS_REVALIDATION —
-// mirroring what SupersedeMemory does for the automatic path, but without
-// inserting a duplicate row, since this memory already exists.
-func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int) error {
+// ConfirmPendingMemory promotes a reviewed memory and applies its proposed
+// relation and dependencies atomically.
+func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisions ...ConfirmationDecision) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
 
-	var state string
+	var state, projectID string
 	var provenanceJSON []byte
 	err = tx.QueryRowContext(ctx, `
-		SELECT state, provenance FROM lemn_memories WHERE id = $1 FOR UPDATE`, pendingID,
-	).Scan(&state, &provenanceJSON)
+		SELECT state, project_id, provenance FROM lemn_memories WHERE id = $1 FOR UPDATE`, pendingID,
+	).Scan(&state, &projectID, &provenanceJSON)
 	if err != nil {
 		return fmt.Errorf("failed to fetch pending memory #%d: %w", pendingID, err)
 	}
-	if state != "PENDING" && state != "PENDING_CONFIRMATION" {
-		return fmt.Errorf("memory #%d is not pending (state=%s); refusing to confirm", pendingID, state)
+	switch state {
+	case "OBSERVED", "CANDIDATE", "PENDING", "PENDING_CONFIRMATION", "NEEDS_REVALIDATION":
+	default:
+		return fmt.Errorf("memory #%d is not awaiting review (state=%s)", pendingID, state)
 	}
 
 	var prov map[string]interface{}
@@ -159,30 +98,118 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int) error 
 			return fmt.Errorf("failed to parse provenance for #%d: %w", pendingID, err)
 		}
 	}
+	if prov == nil {
+		prov = make(map[string]interface{})
+	}
+	decision := ConfirmationDecision{}
+	if len(decisions) > 0 {
+		decision = decisions[0]
+	}
+	if decision.Relation != "" {
+		if decision.Relation != "independent" && decision.Relation != "supersedes" && decision.Relation != "contradicts" {
+			return fmt.Errorf("invalid relation %q", decision.Relation)
+		}
+		prov["proposed_relation"] = decision.Relation
+	}
+	if decision.TargetID > 0 {
+		prov["proposed_target_id"] = decision.TargetID
+	}
+	if decision.ReplaceDependencies {
+		prov["depends_on"] = decision.DependsOn
+	}
 
-	var targetID int
-	hasSingleTarget := false
-	if rawTargets, ok := prov["candidate_targets"]; ok {
-		targetsJSON, _ := json.Marshal(rawTargets)
-		var targets []MatchTarget
-		if err := json.Unmarshal(targetsJSON, &targets); err == nil && len(targets) == 1 {
-			targetID = targets[0].ID
-			hasSingleTarget = true
+	targetID := jsonInt(prov["proposed_target_id"])
+	relation, hasProposedRelation := prov["proposed_relation"].(string)
+	if !hasProposedRelation {
+		relation = "independent"
+		if jsonInt(prov["kernel_schema_version"]) < 2 && (state == "PENDING" || state == "PENDING_CONFIRMATION") {
+			if rawTargets, ok := prov["candidate_targets"]; ok {
+				targetsJSON, _ := json.Marshal(rawTargets)
+				var targets []MatchTarget
+				if err := json.Unmarshal(targetsJSON, &targets); err == nil && len(targets) == 1 {
+					targetID = targets[0].ID
+					relation = "supersedes"
+				}
+			}
+		}
+	}
+	if relation != "supersedes" && relation != "contradicts" {
+		relation = "independent"
+	}
+	if decision.TargetID > 0 && relation == "independent" {
+		return fmt.Errorf("memory #%d has a target override but no supersedes/contradicts relation", pendingID)
+	}
+	if relation != "independent" && targetID <= 0 {
+		return fmt.Errorf("memory #%d proposes %s without a valid target; review its provenance before confirming", pendingID, relation)
+	}
+	if relation == "independent" {
+		delete(prov, "proposed_target_id")
+		delete(prov, "proposed_relation")
+		targetID = 0
+	}
+	prov["confirmed_relation"] = relation
+	// Dependencies are validated before the target flip on purpose: the flip's
+	// cascade demotes the target's dependents, and the confirmer may itself
+	// depend on one of them (its supersedes target's dependent). Validating
+	// after the cascade would let a confirmation fail on a dependency its own
+	// transaction just demoted, rolling back the flip it caused.
+	dependencies := jsonIntSlice(prov["depends_on"])
+	sort.Ints(dependencies)
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lemn_edges WHERE source_id = $1 AND relationship = 'depends_on'`, pendingID); err != nil {
+		return fmt.Errorf("failed to replace dependency edges: %w", err)
+	}
+	for _, dependencyID := range dependencies {
+		if dependencyID <= 0 || dependencyID == pendingID || dependencyID == targetID {
+			return fmt.Errorf("invalid dependency id %d for memory #%d", dependencyID, pendingID)
+		}
+		var dependencyState, dependencyScope string
+		if err := tx.QueryRowContext(ctx, `SELECT state, project_id FROM lemn_memories WHERE id = $1 FOR UPDATE`, dependencyID).Scan(&dependencyState, &dependencyScope); err != nil {
+			return fmt.Errorf("failed to lock dependency #%d: %w", dependencyID, err)
+		}
+		allowedScope := dependencyScope == projectID || (projectID != GlobalScope && dependencyScope == GlobalScope)
+		if dependencyState != "AUTHORITATIVE" || !allowedScope {
+			return fmt.Errorf("dependency #%d is not authoritative and visible in scope %q", dependencyID, projectID)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'depends_on') ON CONFLICT DO NOTHING`, pendingID, dependencyID); err != nil {
+			return fmt.Errorf("failed to write dependency edge to #%d: %w", dependencyID, err)
 		}
 	}
 
-	if hasSingleTarget {
-		if _, err := tx.ExecContext(ctx, `UPDATE lemn_memories SET state = 'SUPERSEDED' WHERE id = $1`, targetID); err != nil {
-			return fmt.Errorf("failed to mark target #%d superseded: %w", targetID, err)
+	if targetID > 0 && relation != "independent" {
+		var targetState, targetScope string
+		if err := tx.QueryRowContext(ctx, `SELECT state, project_id FROM lemn_memories WHERE id = $1 FOR UPDATE`, targetID).Scan(&targetState, &targetScope); err != nil {
+			return fmt.Errorf("failed to lock relation target #%d: %w", targetID, err)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'supersedes')`, pendingID, targetID); err != nil {
-			return fmt.Errorf("failed to write supersedes edge: %w", err)
+		if targetState != "AUTHORITATIVE" || targetScope != projectID {
+			return fmt.Errorf("relation target #%d is no longer authoritative in scope %q", targetID, projectID)
+		}
+		targetState = "SUPERSEDED"
+		if relation == "contradicts" {
+			targetState = "CONTRADICTED"
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE lemn_memories SET state = $1 WHERE id = $2`, targetState, targetID); err != nil {
+			return fmt.Errorf("failed to mark target #%d %s: %w", targetID, targetState, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, pendingID, targetID, relation); err != nil {
+			return fmt.Errorf("failed to write %s edge: %w", relation, err)
 		}
 		if _, err := tx.ExecContext(ctx, `
+			WITH RECURSIVE affected(id) AS (
+				SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on'
+				UNION
+				SELECT e.source_id FROM lemn_edges e JOIN affected a ON e.target_id = a.id WHERE e.relationship = 'depends_on'
+			)
 			UPDATE lemn_memories SET state = 'NEEDS_REVALIDATION'
-			WHERE id IN (SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on')`, targetID); err != nil {
-			return fmt.Errorf("failed to invalidate dependent nodes: %w", err)
+			WHERE state = 'AUTHORITATIVE' AND id IN (SELECT id FROM affected)`, targetID); err != nil {
+			return fmt.Errorf("failed to flag dependent memories for revalidation: %w", err)
 		}
+	}
+	updatedProvenance, err := json.Marshal(prov)
+	if err != nil {
+		return fmt.Errorf("failed to encode reviewed provenance: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE lemn_memories SET provenance = $1 WHERE id = $2`, updatedProvenance, pendingID); err != nil {
+		return fmt.Errorf("failed to save reviewed provenance: %w", err)
 	}
 
 	if _, err := tx.ExecContext(ctx, `UPDATE lemn_memories SET state = 'AUTHORITATIVE' WHERE id = $1`, pendingID); err != nil {
@@ -190,4 +217,28 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int) error 
 	}
 
 	return tx.Commit()
+}
+
+func jsonInt(value interface{}) int {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return 0
+	}
+	var id int
+	if json.Unmarshal(data, &id) != nil {
+		return 0
+	}
+	return id
+}
+
+func jsonIntSlice(value interface{}) []int {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	var ids []int
+	if json.Unmarshal(data, &ids) != nil {
+		return nil
+	}
+	return ids
 }

@@ -102,17 +102,40 @@ ends the turn with no error, which is indistinguishable from a hang.
                        IN THE SAME SCOPE ONLY,
                        above LEMN_SUPERSEDE_THRESHOLD
                         │
-   ┌────────────────────┼─────────────────────┬────────────────────────┐
-   ▼                    ▼                     ▼                        ▼
- evidence +          evidence +            anything            user said "replace",
- exactly 1 match     0 matches             else                "forget", "no longer"
-      │                   │                   │                        │
-  SUPERSEDE          AUTHORITATIVE        CANDIDATE          PENDING_CONFIRMATION
- (old → SUPERSEDED)   (live at once)    (needs promotion)      (needs review)
+   ┌───────────────────┼─────────────────────┬───────────────────────────┐
+   ▼                   ▼                     ▼                           ▼
+ no relevant        relevant tool       explicit correction       relation proposal
+ tool evidence      evidence, no        or extraction relation    needs review
+                    graph impact          │                           │
+   │                   │                  │                           │
+ OBSERVED         AUTHORITATIVE     PENDING_CONFIRMATION ◀────────────┘
+ (auto-promoted   (auto-promoted,      │
+  if confidence    stamped             │ human confirms
+  ≥ LEMN_PROMOTE_  auto_promoted)      ▼
+  THRESHOLD)
+                                   AUTHORITATIVE + graph changes
+                      │
+       ┌──────────────┼────────────────────┐
+       ▼              ▼                    ▼
+  SUPERSEDED     CONTRADICTED      dependents need revalidation
 ```
 
 "Evidence" means the turn carried a tool call whose diff embeds close to the
 claim — that is, the code actually changed in the way the memory says it did.
+
+One branch of the diagram resolves itself without a human. A relation
+proposal (`supersedes`/`contradicts`) that is backed by relevant tool
+evidence **and** whose extraction confidence clears
+`LEMN_AUTO_SUPERSEDE_THRESHOLD` (default 0.95) is confirmed automatically in
+the same background job, through the same `ConfirmPendingMemory`
+transaction `lemn confirm` uses — target flipped, edge written, dependents
+cascaded to `NEEDS_REVALIDATION`. The row is stamped `auto_supersede: true`
+in provenance so unattended graph mutations are auditable. Anything that
+misses a condition — no evidence, confidence below the bar, no valid target,
+or a concurrent change that invalidates the target — stays in
+`PENDING_CONFIRMATION` for human review. The failure direction matches the
+router's philosophy: when in doubt, over-review rather than auto-destroy an
+authoritative memory.
 
 Nothing on this path blocks your conversation: `/log` returns once the turn is
 queued, and every later failure surfaces only in `docker compose logs daemon`.
@@ -128,8 +151,14 @@ queued, and every later failure surfaces only in `docker compose logs daemon`.
                                                  ▼
               SELECT ... WHERE state = 'AUTHORITATIVE'
                            AND project_id IN (<project>, 'global')
-                           AND similarity > LEMN_RETRIEVAL_THRESHOLD
-                         ORDER BY similarity DESC LIMIT 5
+                         ORDER BY similarity DESC LIMIT 5   (top-N, ranked)
+                                                 │
+                                                 ▼
+        in Go: keep those > LEMN_RETRIEVAL_THRESHOLD.
+        If none clear the bar but the best is within
+        LEMN_RETRIEVAL_FALLBACK_MARGIN below it, return the
+        top-N flagged below_threshold (near-miss fallback).
+        Otherwise return [].
                                                  │
                                                  ▼
                    injected into the turn as a separate message
@@ -139,32 +168,108 @@ queued, and every later failure surfaces only in `docker compose logs daemon`.
 
 Reads span your project **plus** `global`. Writes never cross scopes.
 
-On error this returns `[]` rather than failing, so an empty result can mean
-"nothing matched", "nothing is AUTHORITATIVE yet", or "the embedder is down".
-Check the daemon log for `[Retrieval Error]` before concluding the memory is
-missing.
+The threshold is applied in Go, not SQL, so one ranked query serves both the
+normal path and the fallback. The **near-miss fallback** exists because a broad
+question ("what do you know about this project?") embeds a hair under the bar
+against narrow summaries — e.g. a best score of 0.446 against a 0.45 threshold.
+Without the fallback that returns `[]` and the model answers "I have no
+memory"; with it, the top memories are injected (flagged `below_threshold`, so
+the prompt presents them as weaker context). Genuinely unrelated turns — best
+match well below `threshold - margin` — still return nothing, so the prompt is
+not filled with stale memories.
+
+On error this returns `[]` rather than failing, so an empty result can still
+mean "nothing is close enough", "nothing is AUTHORITATIVE yet", or "the
+embedder is down". Check the daemon log for `[Retrieval Error]` before
+concluding the memory is missing.
+
+### Retrieval depth
+
+The `LIMIT 5` above is the extension's default, not a daemon limit — the
+`/retrieve` endpoint accepts any `limit`. The extension reads it from
+`LEMN_RETRIEVAL_LIMIT` (default 5). Five is a prompt-budget choice: injected
+memories are re-sent on every turn, and reads span the project plus `global`,
+so a high limit eventually fills the prompt with stale-but-authoritative noise.
+
+To get a fuller picture without changing the default:
+
+- ask several narrow questions instead of one broad one — ranking is per-query,
+  so different questions surface different slices of the authoritative set;
+- or query the daemon directly with a higher limit:
+
+```bash
+curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $LEMN_SHARED_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"<question>","project_id":"<project>","limit":50}'
+```
+
+- or list everything unranked with `lemn pending` / a direct `SELECT` on
+  `lemn_memories`.
 
 ### Memory lifecycle
 
 ```
-  a new memory lands in one of four states
-  ────────────────────────────────────────
-    evidence + exactly 1 match in scope ──▶ AUTHORITATIVE  (target → SUPERSEDED)
-    evidence + no match                 ──▶ AUTHORITATIVE
-    correction wording, but ambiguous   ──▶ PENDING_CONFIRMATION
-    no tool-call evidence               ──▶ CANDIDATE
+  extracted claim without relevant tool evidence ──▶ OBSERVED
+    (auto-promoted if confidence ≥ LEMN_PROMOTE_THRESHOLD,
+     else inert until review)
+  evidence-backed claim that touches no other memory ──▶ AUTHORITATIVE (auto)
+  relation proposal with tool evidence AND confidence
+  ≥ LEMN_AUTO_SUPERSEDE_THRESHOLD ──▶ auto-confirmed in the same job:
+    AUTHORITATIVE + target SUPERSEDED/CONTRADICTED (stamped auto_supersede)
+  explicit correction or relation proposal       ──▶ PENDING_CONFIRMATION
+    (never auto-promoted, regardless of confidence)
 
-  and moves only on your say-so afterwards
-  ────────────────────────────────────────
-    PENDING_CONFIRMATION ──lemn confirm──▶ AUTHORITATIVE
-    PENDING_CONFIRMATION ──lemn reject───▶ REJECTED
-    CANDIDATE            ──SQL update────▶ AUTHORITATIVE
+  destructive relations (supersedes / contradicts / corrections)
+  require human confirmation; auto-promotion and depends_on do not
+  ────────────────────────────────────────────────
+    OBSERVED / PENDING_CONFIRMATION / legacy CANDIDATE
+      ├── lemn confirm ──▶ AUTHORITATIVE
+      └── lemn reject  ──▶ REJECTED
 
-    AUTHORITATIVE ──a newer memory supersedes it──▶ SUPERSEDED
-                                                    + 'supersedes' edge
-                                                    + dependents marked
-                                                      NEEDS_REVALIDATION
+    confirm supersedes ──▶ prior target: SUPERSEDED
+    confirm contradicts ─▶ prior target: CONTRADICTED
+    (either) ─▶ target's dependents: NEEDS_REVALIDATION
+    confirm revalidated memory ──▶ AUTHORITATIVE
 ```
+
+Extraction may propose relations and dependencies only against the scoped list
+of current authoritative memories. Confirmation revalidates those IDs and
+writes the graph changes atomically. Confirming a `supersedes`/`contradicts`
+relation recursively marks the target's authoritative dependents
+`NEEDS_REVALIDATION`; they stop being retrieved until reviewed and confirmed
+again.
+
+Automatic promotion is deliberately narrow, and it is the **extraction model's
+own call** that the daemon rubber-stamps: the daemon applies thresholds to the
+model's outputs, it does not re-judge the claim. A memory is promoted to
+`AUTHORITATIVE` without review when it is backed by relevant tool evidence
+(`CANDIDATE`, always promoted) or, unbacked (`OBSERVED`), when the model's own
+confidence clears `LEMN_PROMOTE_THRESHOLD` (default 0.9). Confidence-based
+auto-promotions are stamped `auto_promote_reason: confidence` in provenance so
+you can audit them. Rows created as `CANDIDATE` by older versions can still be
+confirmed or rejected normally.
+
+What is actually human-gated is narrower than "everything that touches the
+graph". Only **destructive relations** — `supersedes`, `contradicts`, and
+explicit corrections — force `PENDING_CONFIRMATION`, and only `lemn confirm`
+writes their edges and applies the target's state change (`SUPERSEDED` /
+`CONTRADICTED`) plus the recursive `NEEDS_REVALIDATION` of its dependents. The
+auto path (`insertMemory`) writes the memory row and nothing else: it never
+touches `lemn_edges`. The one exception is the automatic confirmation of
+evidence-backed, high-confidence relation proposals (see the write-path note
+above): it does not bypass the reviewed path, it *is* the reviewed path with
+the human step satisfied by tool evidence plus a stricter confidence bar,
+and it runs the identical transaction.
+
+**Dependencies are the gap.** `depends_on` does *not* force
+`PENDING_CONFIRMATION` — only supersedes/contradicts/correction do. So a memory
+that proposes dependencies but no destructive relation can auto-promote. On that
+path the proposed `depends_on` IDs are stored in provenance but **never written
+to the edge graph**, and because the memory is already `AUTHORITATIVE` it does
+not reappear in `lemn pending` — the dependencies are silently dropped. Only
+dependencies on a memory that *stays* in the queue (a low-confidence `OBSERVED`)
+get applied, via `lemn confirm`. Treat proposed dependencies on auto-promoted
+memories as not-yet-wired until that is fixed.
 
 Only `AUTHORITATIVE` memories are ever retrieved. That is the whole point of the
 state machine: nothing reaches your prompt until it has either earned automatic
@@ -191,7 +296,7 @@ LEMN is different in a few ways:
 - it uses a typed decision step before storing memory at all
 - it keeps a durable local queue so turns are not lost on crash
 - it stores memory states like `AUTHORITATIVE`, `PENDING_CONFIRMATION`, `SUPERSEDED`, and `REJECTED`
-- it supports human review instead of assuming every extraction is correct
+- it auto-promotes only claims that add a leaf (evidence-backed, or high-confidence and unbacked) that propose no destructive relation, and human-reviews every `supersedes`/`contradicts`/correction — except evidence-backed proposals at or above `LEMN_AUTO_SUPERSEDE_THRESHOLD`, which are auto-confirmed through the same transaction a human confirmation uses
 - it separates model routing from memory routing, so the chat path and the memory path can evolve independently
 
 The tradeoff is that LEMN is more opinionated than a plain vector database. It is built for controlled long-horizon memory with review and replacement, not for dumping every trace into a bag of embeddings.
@@ -383,11 +488,17 @@ Register the router as a model in `~/.pi/agent/models.json`:
       "api": "openai-completions",
       "apiKey": "<your LEMN_SHARED_SECRET>",
       "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
-      "models": [{ "id": "lemn", "name": "LEMN (routed)" }]
+      "models": [{ "id": "lemn", "name": "LEMN (routed)", "contextWindow": 98304, "maxTokens": 8192 }]
     }
   }
 }
 ```
+
+Set `contextWindow` to the heavy model's window. Pi triggers auto-compaction
+from this value; left unset it assumes a larger default and sends prompts the
+backend rejects as too long. The router sends anything above
+`LEMN_LONG_CONTEXT_TOKENS` to the heavy model, so keep that below the fast
+model's window minus `maxTokens`.
 
 Install the extension. Pi loads TypeScript directly — there is no build step.
 It must go in its own subdirectory, because Pi treats every `*.ts` directly
@@ -427,16 +538,13 @@ docker compose exec daemon lemn confirm <id>
 docker compose exec daemon lemn reject <id>
 ```
 
-`pending` lists only `PENDING_CONFIRMATION`. Turns without tool-call evidence
-land in `CANDIDATE`, which is neither listed there nor retrievable:
-
-```bash
-docker compose exec postgres psql -U lemn -d lemn_kernel \
-  -c "select id, project_id, summary from lemn_memories where state='CANDIDATE';"
-
-docker compose exec postgres psql -U lemn -d lemn_kernel \
-  -c "update lemn_memories set state='AUTHORITATIVE' where id=<id>;"
-```
+`pending` lists `OBSERVED`, legacy `CANDIDATE` rows, correction proposals, and
+memories that need revalidation. New writes no longer land in `CANDIDATE`:
+evidence-backed independent claims are auto-promoted, so the queue only holds
+memories that need a judgment call. Review the displayed relation/dependency
+proposals before confirming. Use `--relation`, `--target`, `--depends-on`, or
+`--clear-dependencies` to correct them; only `AUTHORITATIVE` memories are
+retrieved.
 
 Lifecycle:
 
@@ -574,6 +682,18 @@ for name, instr in VARIANTS.items():
 Pick the variant with the largest positive separation, paste it into
 `ROUTING_QUESTIONS` or `MEMORY_QUESTIONS`, then `docker compose up -d --build laya`.
 
+For the memory-worthiness question there is a permanent guard:
+[layarouter/eval_memory_gate.py](layarouter/eval_memory_gate.py) pins a
+labelled set of real traffic (decisions, corrections, and confirmed facts that
+must pass; questions, lookups, and acknowledgements that must not) and fails
+if a rewording moves the separation below its recorded floor, misclassifies
+more than the tolerated budget, or flips an anchor example. Run it after any
+change to `MEMORY_QUESTIONS["memory_worthy"]` or `LAYA_MEMORY_THRESHOLD`:
+
+```bash
+docker compose exec laya python eval_memory_gate.py --assert
+```
+
 What worked, from the variants tested here:
 
 - **Concrete and observable beats abstract.** "Reads many parts of a codebase"
@@ -613,8 +733,14 @@ Fine-tune the checkpoint on that data with your own pipeline, then point
 - `LAYA_ROUTING_THRESHOLD=0.38` — calibrated over twelve labelled queries,
   12/12 correct. The old 0.5 with the old question routed **nothing** to the
   heavy model.
-- `LAYA_MEMORY_THRESHOLD=0.5` — roughly separates decisions from chatter, but
-  some genuine preferences score in the low 0.4s and are dropped.
+- `LAYA_MEMORY_THRESHOLD=0.45` — calibrated as a pair with the current
+  wording (see step 3 and `eval_memory_gate.py`): on the labelled set the
+  concrete phrasing separates decisions/corrections from chatter at ~0.45,
+  11/12 correct, where the old abstract wording at 0.5 got 7/12 and dropped
+  genuine corrections. The one tolerated miss is an acknowledgement, which
+  the extraction layer vetoes downstream. The threshold and the question
+  text must be tuned together — moving one without the other undoes the
+  calibration.
 - `LAYA_GLOBAL_THRESHOLD=0.9` — deliberately high. Separation between "project
   fact" and "user preference" was only ~0.04, and rewording the assistant's
   reply moved one case across the line. High means everything stays
@@ -623,6 +749,14 @@ Fine-tune the checkpoint on that data with your own pipeline, then point
   Embedder-specific: with `bge-m3` a question matching its own answer scores
   ~0.5 and unrelated text 0.3–0.4. Swap embedders and re-measure, or retrieval
   silently returns nothing.
+- `LEMN_RETRIEVAL_FALLBACK_MARGIN=0.10` — the near-miss safety net. When no
+  memory clears the threshold, the top memories are still injected if the best
+  is within this margin below it (best ≥ threshold − margin). This is what lets
+  a broad "what do you know about this project?" (best 0.446) return something
+  instead of `[]`. It is a *ranking* floor, not a relevance claim: the injected
+  memories are flagged `below_threshold` and the prompt tells the model to treat
+  them as weaker context. Raise it to inject more aggressively (1.0 = always),
+  lower it toward 0 to require a real match.
 
 ## Running without Docker
 
@@ -704,9 +838,9 @@ export LEMN_POSTGRES_DSN="postgres://lemn:CHANGE_ME@localhost:5432/lemn_kernel?s
 
 | Command | Effect |
 |---|---|
-| `./bin/lemn pending` | Lists `PENDING` and `PENDING_CONFIRMATION` memories, with their project and any supersession target |
-| `./bin/lemn confirm <id>` | Promotes to `AUTHORITATIVE`; if it names exactly one target, that target becomes `SUPERSEDED` and its dependents `NEEDS_REVALIDATION` |
-| `./bin/lemn reject <id>` | Marks the pending memory `REJECTED`, leaving the current authoritative one in place |
+| `./bin/lemn pending` | Lists `OBSERVED`, legacy `CANDIDATE`, pending, and `NEEDS_REVALIDATION` memories with proposed relations and dependencies |
+| `./bin/lemn confirm <id> [options]` | Promotes a reviewed memory; supports `--relation`, `--target`, `--depends-on id,id`, and `--clear-dependencies` to correct proposals before atomic validation and application |
+| `./bin/lemn reject <id>` | Marks a reviewable memory `REJECTED`, leaving current authoritative memories in place |
 | `./bin/labeler` | Interactive review of unlabelled turns from the SQLite queue |
 | `./bin/export` | Writes reviewed turns to `data/train.jsonl` and `data/valid.jsonl` |
 
@@ -733,12 +867,18 @@ DELETE FROM lemn_edges WHERE target_id = <id> AND relationship = 'supersedes';
 | `LEMN_HEAVY_MODEL_NAME` | unset | router |
 | `LEMN_BACKEND_API_KEY` | unset | router, daemon |
 | `LEMN_CLASSIFY_TIMEOUT` | `5s` | router |
+| `LEMN_BACKEND_IDLE_TIMEOUT` | `25m` | router |
+| `LEMN_LONG_CONTEXT_TOKENS` | `30000` | router |
 | `LEMN_EXTRACTION_URL` | `http://localhost:8000/v1/chat/completions` | daemon |
 | `LEMN_EXTRACTION_MODEL` | `qwen2.5-coder` | daemon |
 | `LEMN_EMBEDDING_URL` | `http://localhost:8001/v1/embeddings` | daemon |
 | `LEMN_EMBEDDING_MODEL` | `bge-m3` | daemon |
 | `LEMN_RETRIEVAL_THRESHOLD` | `0.45` | daemon |
+| `LEMN_RETRIEVAL_FALLBACK_MARGIN` | `0.10` | daemon |
+| `LEMN_RETRIEVAL_LIMIT` | `5` | Pi extension |
 | `LEMN_SUPERSEDE_THRESHOLD` | `0.82` | daemon |
+| `LEMN_PROMOTE_THRESHOLD` | `0.9` | daemon |
+| `LEMN_AUTO_SUPERSEDE_THRESHOLD` | `0.95` | daemon |
 | `LEMN_LAYA_TIMEOUT` | `60s` | daemon |
 | `LEMN_EXTRACTION_TIMEOUT` | `120s` | daemon |
 | `LEMN_SQLITE_PATH` | `./lemn_data.db` | daemon, labeler, export |
@@ -746,7 +886,7 @@ DELETE FROM lemn_edges WHERE target_id = <id> AND relationship = 'supersedes';
 | `LEMN_DAEMON_URL` | `http://localhost:8080` | Pi extension |
 | `LAYA_MODEL_REPO` | `convaiinnovations/laya-typed-decisions` | Laya service |
 | `LAYA_ROUTING_THRESHOLD` | `0.38` | Laya service |
-| `LAYA_MEMORY_THRESHOLD` | `0.5` | Laya service |
+| `LAYA_MEMORY_THRESHOLD` | `0.45` | Laya service |
 | `LAYA_GLOBAL_THRESHOLD` | `0.67` | Laya service |
 | `LEMN_WORKER_COUNT` | `2` | daemon |
 | `LEMN_POSTGRES_DSN` | required for kernel/admin commands | daemon, `cmd/lemn` |
@@ -801,7 +941,7 @@ If you are not comfortable using software developed with significant AI assistan
 | Symptom | Likely cause |
 |---|---|
 | Every request feels slow and answers are oddly thorough | Laya is timing out and the router is failing open to heavy. Check `docker compose logs router` for `failing open`, and raise `LEMN_CLASSIFY_TIMEOUT` |
-| `/retrieve` always returns `[]` | `LEMN_RETRIEVAL_THRESHOLD` is too high for your embedder, or the memory is still `CANDIDATE` rather than `AUTHORITATIVE` |
+| `/retrieve` returns `[]` for a question that should match | The best match fell below `threshold − LEMN_RETRIEVAL_FALLBACK_MARGIN` (genuinely unrelated), or nothing is `AUTHORITATIVE` yet, or the embedder is down. Raise `LEMN_RETRIEVAL_FALLBACK_MARGIN` to catch near misses; check the daemon log for `[Retrieval Error]` to rule out the embedder |
 | Memories never appear at all | Check `docker compose logs daemon` for `[Gate]` lines. No line means the job failed before the gate; the model server is the usual cause |
 | `404` from the backend | A `*_MODEL_NAME` does not match an id from `/v1/models` |
 | First turn takes a minute, later ones are fast | Normal prompt prefill. Enable your model server's prompt cache |
