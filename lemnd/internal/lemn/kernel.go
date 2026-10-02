@@ -23,6 +23,28 @@ type evidenceSignal struct {
 	Tool       string
 }
 
+func evidenceSignalFromScores(toolNames []string, similarities []float64) evidenceSignal {
+	var signal evidenceSignal
+	count := len(toolNames)
+	if len(similarities) < count {
+		count = len(similarities)
+	}
+	if count == 0 {
+		return signal
+	}
+
+	signal.Tool = toolNames[0]
+	signal.Similarity = similarities[0]
+	for index := 1; index < count; index++ {
+		if similarities[index] > signal.Similarity {
+			signal.Tool = toolNames[index]
+			signal.Similarity = similarities[index]
+		}
+	}
+	signal.Relevant = signal.Similarity >= evidenceRelevanceThreshold
+	return signal
+}
+
 // measureEvidence scans every tool call rather than stopping at the first
 // match, so the logged similarity is the true best.
 func measureEvidence(ctx context.Context, mem MemoryNode, toolCalls []ToolCallEvidence) (evidenceSignal, error) {
@@ -39,6 +61,8 @@ func measureEvidence(ctx context.Context, mem MemoryNode, toolCalls []ToolCallEv
 		}
 	}
 
+	toolNames := make([]string, 0, len(toolCalls))
+	similarities := make([]float64, 0, len(toolCalls))
 	for _, tc := range toolCalls {
 		if tc.DiffText == "" {
 			continue
@@ -47,12 +71,10 @@ func measureEvidence(ctx context.Context, mem MemoryNode, toolCalls []ToolCallEv
 		if err != nil {
 			continue
 		}
-		if s := cosineSimilarity(claimEmbedding, diffEmbedding); s > sig.Similarity {
-			sig.Similarity, sig.Tool = s, tc.Name
-		}
+		toolNames = append(toolNames, tc.Name)
+		similarities = append(similarities, cosineSimilarity(claimEmbedding, diffEmbedding))
 	}
-	sig.Relevant = sig.Similarity >= evidenceRelevanceThreshold
-	return sig, nil
+	return evidenceSignalFromScores(toolNames, similarities), nil
 }
 
 func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) {

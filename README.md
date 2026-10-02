@@ -758,6 +758,124 @@ Fine-tune the checkpoint on that data with your own pipeline, then point
   them as weaker context. Raise it to inject more aggressively (1.0 = always),
   lower it toward 0 to require a real match.
 
+## End-to-end Memory Benchmark
+
+`scripts/memory_bench.py` creates a fresh, uniquely named project scope for each
+synthetic project in `scripts/memory_bench_corpus.json`, embeds and inserts its
+initial fixture memories, then compares no memory, that project's fixed
+`AGENTS.md`, and real LEMN `/retrieve` results. It first asks baseline questions,
+then simulates learning an updated alpha retry limit by marking the old memory
+`SUPERSEDED` and inserting the new `AUTHORITATIVE` value. It asks the same
+question again after the update. Alpha's `AGENTS.md` remains at the original
+value for both phases; beta is an unchanged control project. It never reads or
+writes the existing `limn` project scope.
+
+The corpus is deterministic retrieval test data inserted directly as memory
+rows. The staged update exercises LEMN's persisted state transition and retrieval
+of the new fact, but it does **not** test whether the conversation extractor
+would notice a changed fact or automatically promote it. The write-path evaluator
+below exercises that separately. Per-project AGENTS fixtures are real files under
+`scripts/memory_bench_projects/`; the harness reads them and never edits them.
+
+1. Review `scripts/memory_bench_tasks.jsonl`, `scripts/memory_bench_corpus.json`,
+   and the two fixture `AGENTS.md` files. Keep task rubrics fixed before seeing
+   answers. Tasks use `phase` (`before_learning` or `after_learning`) and
+   `project_key` to select the baseline/update point and isolated project.
+2. Ensure Docker Compose Postgres, the daemon, the embedding endpoint, and the
+  direct model endpoint are running. Use the direct model endpoint, not the
+  LEMN router, to hold the model constant.
+3. Load `LEMN_SHARED_SECRET` and, if required, `LEMN_BACKEND_API_KEY` from
+  `.env`. Validate without making requests or database changes:
+
+  ```bash
+  set -a; source .env; set +a
+  python3 scripts/memory_bench.py --validate-only
+  ```
+
+4. Run randomized paired queries within each phase. Baseline tasks run first;
+  then the scripted alpha update occurs; post-learning tasks run afterward.
+  Each run prints its temporary project IDs, inserts only rows stamped with
+  that run's unique marker, and deletes those rows in a `finally` cleanup:
+
+  ```bash
+  python3 scripts/memory_bench.py --model 4-bit \
+    --completions-url http://localhost:9001/v1/chat/completions \
+    --embeddings-url http://localhost:9001/v1/embeddings \
+    --out /tmp/lemn-memory-bench --repeats 2
+  ```
+
+    To focus just on the before/after behavior and beta control, pass
+    `--task-ids alpha-retry-before,alpha-retry-after,beta-region-before,beta-region-after`.
+5. Score `blind-results.jsonl` before opening `condition-key.jsonl`. Use each
+  task ID and rubric to fill `accuracy_0_or_1`, `factuality_0_to_2`,
+  `usefulness_0_to_2`, and notes in `blind-scores.csv`. Then report:
+
+  ```bash
+  python3 scripts/memory_bench.py --report /tmp/lemn-memory-bench
+  ```
+
+The benchmark deletes its fixture rows on normal completion or handled errors.
+A forced process kill or machine shutdown can bypass cleanup; leftover rows
+remain isolated under `lemn-bench-<run-id>-<project-key>` and cannot affect
+ordinary projects. Check `condition-key.jsonl` for the run ID and remove those
+fixture rows manually if needed. Check daemon logs when a retrieval result is
+empty, since embedding failures are currently returned as an empty array. This
+benchmark does not measure tool-using coding tasks or extraction quality.
+
+### Isolated staged-learning run
+
+On 2026-10-02, one full pass scored 8 tasks across the three arms. LEMN and
+AGENTS each met all 8 rubrics; no memory met 3/8. In the staged alpha update,
+both arms answered 2 before the update, then LEMN answered 4 while the unchanged
+AGENTS fixture continued to answer 2. The beta control stayed at `us-east-2`,
+and both memory arms abstained on the cross-project questions. Mean prompt usage
+was 256 tokens for LEMN and 210 for AGENTS; mean response time was 5.3s and 5.0s
+respectively in this run.
+
+This was one pass over synthetic facts, and the state update was applied by the
+benchmark fixture rather than learned from a conversation. It demonstrates that
+retrieval reflects a stored update while the static file stays unchanged; it is
+not evidence that the extractor will discover, validate, and promote real
+updates. Repeat with more varied facts and wording before drawing conclusions.
+
+### Write-path evaluation
+
+`scripts/memory_write_bench.py` runs labeled turns through the real `/log` worker
+path: Laya worthiness gate, extractor, cosine evidence check, relation handling,
+and Postgres routing. It starts a one-off daemon with a temporary SQLite file,
+uses unique Postgres project scopes, and stops the daemon and deletes those
+scoped memories at the end. `/jobs/{id}` is an authenticated read-only endpoint
+used to wait for a durable job and inspect its extraction result; it never
+returns the submitted turn payload.
+
+The labeled cases in `scripts/memory_write_bench_cases.jsonl` cover a durable
+decision, a tool-backed change with an existing fact to supersede, a lookup,
+acknowledgement, conversation recap, and tentative idea. Validate without
+starting services, then run from the repository root with Docker Compose,
+Postgres, Laya, and the model/embedding endpoint available:
+
+```bash
+set -a; source .env; set +a
+python3 scripts/memory_write_bench.py --validate-only
+python3 scripts/memory_write_bench.py --out /tmp/lemn-memory-write-bench
+```
+
+The report separates **gate** precision/recall from **final memory**
+precision/recall, and includes extractor vetoes, summary term checks, and
+expected relation checks. It writes detailed per-case extraction and created
+memory provenance to `write-results.json`. These are small hand-labeled examples,
+so treat the scores as diagnostics rather than a calibrated quality estimate.
+
+On 2026-10-02, one six-case run had gate precision `0.67` and recall `1.00`:
+both positive cases passed the gate, while one lookup also passed. The extractor
+vetoed that lookup, yielding final memory precision and recall of `1.00` on this
+small set. Both positive summaries and both expected relations matched. For the
+tool-backed supersede, evidence cosine was `0.784` and target similarity was
+`0.880`, above the existing `0.60` and `0.82` thresholds. This is one positive
+cosine case, not enough evidence to retune either cutoff. The run also exposed a
+malformed optional `depends_on` value from the model; the daemon now logs and
+ignores malformed dependency hints rather than discarding the whole extraction.
+
 ## Running without Docker
 
 If you want to start each piece yourself:
@@ -899,7 +1017,7 @@ If you change `LEMN_EMBEDDING_MODEL`, update the `vector(1024)` column width in 
 | Port | Service |
 |---|---|
 | 8002 | Laya classifier service |
-| 8080 | LEMN daemon (`/log`, `/retrieve`) |
+| 8080 | LEMN daemon (`/log`, `/jobs/{id}`, `/retrieve`) |
 | 8090 | LEMN router (OpenAI-compatible, point Pi here) |
 
 Model endpoints are wherever your server runs. LEMN supports both layouts:

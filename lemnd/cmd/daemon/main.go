@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -70,6 +71,7 @@ func main() {
 	log.Printf("Started %d job worker(s)", workerCount)
 
 	http.HandleFunc("/log", authmw.Require(sharedSecret, handleLog(sqliteDB)))
+	http.HandleFunc("/jobs/", authmw.Require(sharedSecret, handleJobStatus(sqliteDB)))
 	http.HandleFunc("/retrieve", authmw.Require(sharedSecret, handleRetrieve(pgDB)))
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
@@ -171,6 +173,54 @@ func handleRetrieve(pgDB *sql.DB) http.HandlerFunc {
 	}
 }
 
+func handleJobStatus(sqliteDB *sql.DB) http.HandlerFunc {
+	type response struct {
+		JobID      int64           `json:"job_id"`
+		TurnID     string          `json:"turn_id"`
+		Status     string          `json:"status"`
+		Attempts   int             `json:"attempts"`
+		Error      string          `json:"error,omitempty"`
+		Extraction json.RawMessage `json:"extraction,omitempty"`
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		rawID := strings.TrimPrefix(r.URL.Path, "/jobs/")
+		jobID, err := strconv.ParseInt(rawID, 10, 64)
+		if err != nil || jobID <= 0 {
+			http.Error(w, "invalid job id", http.StatusBadRequest)
+			return
+		}
+
+		var result response
+		var lastError, extraction sql.NullString
+		err = sqliteDB.QueryRowContext(r.Context(), `
+			SELECT j.id, j.turn_id, j.status, j.attempts, j.error, t.raw_llm_json
+			FROM memory_jobs j LEFT JOIN turns t ON t.id = j.turn_id
+			WHERE j.id = ?`, jobID,
+		).Scan(&result.JobID, &result.TurnID, &result.Status, &result.Attempts, &lastError, &extraction)
+		if err == sql.ErrNoRows {
+			http.Error(w, "job not found", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			log.Printf("[Job Status Error]: %v", err)
+			http.Error(w, "failed to query job status", http.StatusInternalServerError)
+			return
+		}
+		if lastError.Valid {
+			result.Error = lastError.String
+		}
+		if extraction.Valid && json.Valid([]byte(extraction.String)) {
+			result.Extraction = json.RawMessage(extraction.String)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(result)
+	}
+}
+
 func readAll(r *http.Request) ([]byte, error) {
 	defer r.Body.Close()
 	buf := new(bytes.Buffer)
@@ -258,17 +308,32 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 	return nil
 }
 
+func rejectedByWorthinessGate(probability float64) lemn.ModelExtraction {
+	return lemn.ModelExtraction{
+		MemoryWorthy:    false,
+		GatePassed:      false,
+		Type:            "none",
+		GateProbability: probability,
+	}
+}
+
+func rejectedByExtractor(gateProbability, extractionConfidence float64) lemn.ModelExtraction {
+	return lemn.ModelExtraction{
+		MemoryWorthy:    false,
+		GatePassed:      true,
+		Type:            "none",
+		Confidence:      extractionConfidence,
+		GateProbability: gateProbability,
+	}
+}
+
 func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtraction, error) {
 	memoryWorthy, probability, globallyApplicable, err := decideMemoryWorthiness(t)
 	if err != nil {
 		return lemn.ModelExtraction{}, err
 	}
 	if !memoryWorthy {
-		return lemn.ModelExtraction{
-			MemoryWorthy: false,
-			Type:         "none",
-			Confidence:   probability,
-		}, nil
+		return rejectedByWorthinessGate(probability), nil
 	}
 
 	scope := lemn.NormalizeScope(t.ProjectID)
@@ -351,23 +416,23 @@ Authoritative memories eligible as dependencies (same scope or global):
 	}
 
 	var payload struct {
-		Type       string  `json:"type"`
-		Summary    string  `json:"summary"`
-		Confidence float64 `json:"confidence"`
-		DependsOn  []int   `json:"depends_on"`
+		Type       string          `json:"type"`
+		Summary    string          `json:"summary"`
+		Confidence float64         `json:"confidence"`
+		DependsOn  json.RawMessage `json:"depends_on"`
 	}
 	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), &payload); err != nil {
 		return lemn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
+	}
+	dependsOn, err := parseDependencyIDs(payload.DependsOn)
+	if err != nil {
+		log.Printf("[Extraction] turn %s has malformed depends_on; ignoring dependency hints: %v", t.ID, err)
 	}
 
 	// Type "none" is the extraction model's own veto: Laya thought the turn
 	// was worth a look, but there was no durable claim in it to store.
 	if payload.Type == "" || payload.Type == "none" || lemn.IsMetaSummary(payload.Summary) {
-		return lemn.ModelExtraction{
-			MemoryWorthy: false,
-			Type:         "none",
-			Confidence:   payload.Confidence,
-		}, nil
+		return rejectedByExtractor(probability, payload.Confidence), nil
 	}
 
 	relation := "independent"
@@ -394,6 +459,7 @@ Authoritative memories eligible as dependencies (same scope or global):
 	}
 	return lemn.ModelExtraction{
 		MemoryWorthy:           true,
+		GatePassed:             true,
 		GlobalScoped:           globallyApplicable,
 		Type:                   payload.Type,
 		Summary:                payload.Summary,
@@ -401,11 +467,46 @@ Authoritative memories eligible as dependencies (same scope or global):
 		GateProbability:        probability,
 		Relation:               relation,
 		TargetID:               targetID,
-		DependsOn:              payload.DependsOn,
+		DependsOn:              dependsOn,
 		DependencyCandidateIDs: dependencyIDs,
 		RelationCandidates:     relationCandidates,
 		SummaryEmbedding:       summaryEmbedding,
 	}, nil
+}
+
+func parseDependencyIDs(raw json.RawMessage) ([]int, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, nil
+	}
+	var ids []int
+	if err := json.Unmarshal(raw, &ids); err == nil {
+		return ids, nil
+	}
+	var values []string
+	if err := json.Unmarshal(raw, &values); err == nil {
+		ids = make([]int, 0, len(values))
+		for _, value := range values {
+			id, err := strconv.Atoi(strings.TrimSpace(value))
+			if err != nil {
+				return nil, fmt.Errorf("dependency ID %q is not an integer", value)
+			}
+			ids = append(ids, id)
+		}
+		return ids, nil
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err == nil {
+		value = strings.TrimSpace(value)
+		if value == "" || strings.EqualFold(value, "none") || value == "[]" {
+			return nil, nil
+		}
+		id, err := strconv.Atoi(value)
+		if err == nil {
+			return []int{id}, nil
+		}
+		return nil, fmt.Errorf("dependency hint %q is not an integer or empty value", value)
+	}
+	return nil, fmt.Errorf("dependency hints must be an integer array")
 }
 
 func classifyRelation(t lemn.TurnPayload, summary string, candidates []lemn.MatchTarget) (string, int, error) {

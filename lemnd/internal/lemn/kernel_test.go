@@ -37,8 +37,8 @@ func TestJsonIntSlice(t *testing.T) {
 	}{
 		{name: "nil", value: nil, want: nil},
 		{
-			name:  "json array of numbers", value: []interface{}{float64(2), float64(4)},
-			want:  []int{2, 4},
+			name: "json array of numbers", value: []interface{}{float64(2), float64(4)},
+			want: []int{2, 4},
 		},
 		{
 			name: "go slice of ints", value: []int{1, 3},
@@ -74,5 +74,39 @@ func TestMeasureEvidenceNoToolCalls(t *testing.T) {
 	}
 	if sig.Relevant || sig.Tool != "" || sig.Similarity != 0 {
 		t.Fatalf("measureEvidence() = %+v, want zero signal with no tool calls", sig)
+	}
+}
+
+func TestEvidenceSignalFromScores(t *testing.T) {
+	tests := []struct {
+		name         string
+		tools        []string
+		scores       []float64
+		wantTool     string
+		wantScore    float64
+		wantRelevant bool
+	}{
+		{name: "exact threshold is relevant", tools: []string{"read"}, scores: []float64{0.60}, wantTool: "read", wantScore: 0.60, wantRelevant: true},
+		{name: "just below threshold is retained but not relevant", tools: []string{"read"}, scores: []float64{0.599}, wantTool: "read", wantScore: 0.599},
+		{name: "selects strongest tool even when it appears later", tools: []string{"read", "edit", "bash"}, scores: []float64{0.42, 0.81, 0.66}, wantTool: "edit", wantScore: 0.81, wantRelevant: true},
+		{name: "ties keep the first strongest tool", tools: []string{"read", "edit"}, scores: []float64{0.71, 0.71}, wantTool: "read", wantScore: 0.71, wantRelevant: true},
+		{name: "negative similarities are not replaced by zero", tools: []string{"read", "edit"}, scores: []float64{-0.4, -0.2}, wantTool: "edit", wantScore: -0.2},
+		{name: "no usable scores returns empty signal", tools: []string{"read"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := evidenceSignalFromScores(test.tools, test.scores)
+			if got.Tool != test.wantTool || got.Similarity != test.wantScore || got.Relevant != test.wantRelevant {
+				t.Fatalf("evidenceSignalFromScores() = %+v, want tool=%q similarity=%v relevant=%v", got, test.wantTool, test.wantScore, test.wantRelevant)
+			}
+		})
+	}
+}
+
+func TestCosineThresholdSignalBoundary(t *testing.T) {
+	score := cosineSimilarity([]float32{1, 0}, []float32{0.6, 0.8})
+	signal := evidenceSignalFromScores([]string{"edit"}, []float64{score})
+	if !signal.Relevant {
+		t.Fatalf("cosine score %v at the configured boundary should be relevant", score)
 	}
 }

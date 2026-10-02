@@ -1,0 +1,24 @@
+{
+  "projects": {
+    "alpha": {
+      "agents_file": "memory_bench_projects/alpha/AGENTS.md",
+      "memories": [
+        {"state":"AUTHORITATIVE","summary":"In project alpha, the billing API staging deployment is in eu-west-1."},
+        {"state":"AUTHORITATIVE","summary":"In project alpha, the billing service retries failed requests up to 2 times."}
+      ],
+      "updates": [
+        {
+          "target_summary":"In project alpha, the billing service retries failed requests up to 2 times.",
+          "summary":"In project alpha, the billing service retries failed requests up to 4 times."
+        }
+      ]
+    },
+    "beta": {
+      "agents_file": "memory_bench_projects/beta/AGENTS.md",
+      "memories": [
+        {"state":"AUTHORITATIVE","summary":"In project beta, the billing API staging deployment is in us-east-2."},
+        {"state":"AUTHORITATIVE","summary":"In project beta, the billing service retries failed requests up to 3 times."}
+      ]
+    }
+  }
+}
