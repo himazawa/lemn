@@ -250,8 +250,11 @@ through `lemn revalidate`. Ordinary `confirm` and
 confirmation or an evidence note with a source reference and RFC3339 observation
 time at or after invalidation. Any retained dependencies must still be
 authoritative; stale dependencies must be replaced or cleared. The source
-reference and time are reviewer-supplied attestations: LEMN records them but
-does not fetch or independently verify the source.
+reference and time are reviewer-supplied attestations: LEMN records them and a
+SHA-256 digest of the note, but does not fetch or independently verify the
+source. Evidence must be no older than `LEMN_REVALIDATION_MAX_EVIDENCE_AGE`
+(default `720h`, 30 days); explicit user confirmation is the fallback when
+current source evidence is unavailable.
 
 Automatic promotion is deliberately narrow, and it is the **extraction model's
 own call** that the daemon rubber-stamps: the daemon applies thresholds to the
@@ -1091,6 +1094,7 @@ DELETE FROM lemn_edges WHERE target_id = <id> AND relationship = 'supersedes';
 | `LEMN_SUPERSEDE_THRESHOLD` | `0.82` | daemon |
 | `LEMN_PROMOTE_THRESHOLD` | `0.9` | daemon |
 | `LEMN_AUTO_SUPERSEDE_THRESHOLD` | `0.95` | daemon |
+| `LEMN_REVALIDATION_MAX_EVIDENCE_AGE` | `720h` | daemon |
 | `LEMN_LAYA_TIMEOUT` | `60s` | daemon |
 | `LEMN_EXTRACTION_TIMEOUT` | `120s` | daemon |
 | `LEMN_SQLITE_PATH` | `./lemn_data.db` | daemon, labeler, export |

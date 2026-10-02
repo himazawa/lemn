@@ -2,7 +2,9 @@ package lemn
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -28,6 +30,7 @@ type RevalidationDecision struct {
 }
 
 const evidenceRelevanceThreshold = 0.60
+const defaultRevalidationEvidenceMaxAge = 30 * 24 * time.Hour
 
 type evidenceSignal struct {
 	Relevant   bool
@@ -271,7 +274,11 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision RevalidationDecision) error {
 	evidence := strings.TrimSpace(decision.Evidence)
 	evidenceSource := strings.TrimSpace(decision.EvidenceSource)
-	if err := validateRevalidationDecision(decision, time.Now()); err != nil {
+	maxEvidenceAge, err := revalidationEvidenceMaxAge()
+	if err != nil {
+		return err
+	}
+	if err := validateRevalidationDecision(decision, time.Now(), maxEvidenceAge); err != nil {
 		return err
 	}
 
@@ -390,6 +397,8 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 	}
 	if evidence != "" {
 		entry["evidence_note"] = evidence
+		digest := sha256.Sum256([]byte(evidence))
+		entry["evidence_note_sha256"] = hex.EncodeToString(digest[:])
 		entry["evidence_source"] = evidenceSource
 		entry["evidence_observed_at"] = decision.EvidenceObservedAt.UTC().Format(time.RFC3339Nano)
 	}
@@ -435,7 +444,16 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 	return tx.Commit()
 }
 
-func validateRevalidationDecision(decision RevalidationDecision, now time.Time) error {
+func revalidationEvidenceMaxAge() (time.Duration, error) {
+	value := getenv("LEMN_REVALIDATION_MAX_EVIDENCE_AGE", defaultRevalidationEvidenceMaxAge.String())
+	maxAge, err := time.ParseDuration(value)
+	if err != nil || maxAge <= 0 {
+		return 0, fmt.Errorf("LEMN_REVALIDATION_MAX_EVIDENCE_AGE must be a positive duration, got %q", value)
+	}
+	return maxAge, nil
+}
+
+func validateRevalidationDecision(decision RevalidationDecision, now time.Time, maxAge time.Duration) error {
 	evidence := strings.TrimSpace(decision.Evidence)
 	source := strings.TrimSpace(decision.EvidenceSource)
 	if evidence == "" {
@@ -455,6 +473,12 @@ func validateRevalidationDecision(decision RevalidationDecision, now time.Time) 
 	}
 	if decision.EvidenceObservedAt.After(now) {
 		return fmt.Errorf("evidence observation time cannot be in the future")
+	}
+	if maxAge <= 0 {
+		return fmt.Errorf("maximum evidence age must be positive")
+	}
+	if age := now.Sub(decision.EvidenceObservedAt); age > maxAge {
+		return fmt.Errorf("evidence is older than the maximum age of %s; use explicit user confirmation", maxAge)
 	}
 	return nil
 }

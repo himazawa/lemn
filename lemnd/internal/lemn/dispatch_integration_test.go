@@ -2,7 +2,9 @@ package lemn
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -270,7 +272,8 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 		t.Fatalf("revalidation_history = %v, want one audit entry", revalidated["revalidation_history"])
 	}
 	entry, ok := history[0].(map[string]interface{})
-	if !ok || entry["reason"] != "dependency_superseded" || jsonInt(entry["invalidated_by_memory_id"]) != replacementID || jsonInt(entry["invalidated_dependency_id"]) != dependencyID || entry["evidence_note"] != decision.Evidence || entry["evidence_source"] != decision.EvidenceSource || entry["evidence_observed_at"] != decision.EvidenceObservedAt.Format(time.RFC3339Nano) || entry["invalidated_at"] != invalidatedAtText || entry["user_confirmed"] != false {
+	evidenceDigest := sha256.Sum256([]byte(decision.Evidence))
+	if !ok || entry["reason"] != "dependency_superseded" || jsonInt(entry["invalidated_by_memory_id"]) != replacementID || jsonInt(entry["invalidated_dependency_id"]) != dependencyID || entry["evidence_note"] != decision.Evidence || entry["evidence_note_sha256"] != hex.EncodeToString(evidenceDigest[:]) || entry["evidence_source"] != decision.EvidenceSource || entry["evidence_observed_at"] != decision.EvidenceObservedAt.Format(time.RFC3339Nano) || entry["invalidated_at"] != invalidatedAtText || entry["user_confirmed"] != false {
 		t.Fatalf("revalidation history entry = %v, missing attestation or invalidation details", history[0])
 	}
 	var remainingDependencies int

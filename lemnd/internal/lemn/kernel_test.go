@@ -121,6 +121,7 @@ func TestRevalidationRequiresEvidenceOrUserConfirmation(t *testing.T) {
 
 func TestValidateRevalidationDecision(t *testing.T) {
 	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	maxAge := defaultRevalidationEvidenceMaxAge
 	tests := []struct {
 		name     string
 		decision RevalidationDecision
@@ -133,10 +134,11 @@ func TestValidateRevalidationDecision(t *testing.T) {
 		{name: "missing observation time", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api"}, wantErr: "an evidence observation time is required with an evidence note"},
 		{name: "source without evidence", decision: RevalidationDecision{EvidenceSource: "https://docs.example.test/api"}, wantErr: "evidence source and observation time require an evidence note"},
 		{name: "future observation time", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(time.Second)}, wantErr: "evidence observation time cannot be in the future"},
+		{name: "evidence exceeds maximum age", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(-maxAge - time.Second)}, wantErr: "evidence is older than the maximum age of 720h0m0s; use explicit user confirmation"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateRevalidationDecision(test.decision, now)
+			err := validateRevalidationDecision(test.decision, now, maxAge)
 			if test.wantErr == "" && err != nil {
 				t.Fatalf("validateRevalidationDecision() error = %v, want nil", err)
 			}
@@ -144,6 +146,23 @@ func TestValidateRevalidationDecision(t *testing.T) {
 				t.Fatalf("validateRevalidationDecision() error = %v, want %q", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestRevalidationEvidenceMaxAgeConfiguration(t *testing.T) {
+	t.Setenv("LEMN_REVALIDATION_MAX_EVIDENCE_AGE", "")
+	if got, err := revalidationEvidenceMaxAge(); err != nil || got != defaultRevalidationEvidenceMaxAge {
+		t.Fatalf("default max evidence age = %v, error %v; want %v", got, err, defaultRevalidationEvidenceMaxAge)
+	}
+	t.Setenv("LEMN_REVALIDATION_MAX_EVIDENCE_AGE", "48h")
+	if got, err := revalidationEvidenceMaxAge(); err != nil || got != 48*time.Hour {
+		t.Fatalf("configured max evidence age = %v, error %v; want 48h", got, err)
+	}
+	for _, value := range []string{"invalid", "0", "-1h"} {
+		t.Setenv("LEMN_REVALIDATION_MAX_EVIDENCE_AGE", value)
+		if _, err := revalidationEvidenceMaxAge(); err == nil {
+			t.Errorf("revalidationEvidenceMaxAge() with %q succeeded, want error", value)
+		}
 	}
 }
 
