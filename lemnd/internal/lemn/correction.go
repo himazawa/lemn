@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"strings"
 )
 
 // Statement-vs-statement similarity runs higher than the retrieval case, but
@@ -36,7 +35,9 @@ func NormalizeScope(projectID string) string {
 
 var correctionRegex = regexp.MustCompile(`(?i)\b(forget|replace|no longer|instead of|switched from|migrate from|supersede)\b`)
 var negationRegex = regexp.MustCompile(`(?i)\b(don't|do not|won't|will not|never|shouldn't|cannot|can't)\s+(replace|forget|supersede|migrate)\b`)
-var temporaryPreferenceRegex = regexp.MustCompile(`(?i)\b(this answer only|for this answer|this task only|for this task only|just this time)\b`)
+var temporaryPreferenceRegex = regexp.MustCompile(`(?i)\b(this answer only|for this answer|this task only|for this task only|just this time|just this once|this one time|this one response|for this response only|in this reply only)\b`)
+var durablePreferenceRegex = regexp.MustCompile(`(?i)\b(prefer|preference|i like|i tend to|i usually|i always|for future)\b`)
+var globalPreferenceScopeRegex = regexp.MustCompile(`(?i)\b(across|in|for)\s+(all|every|any)\s+(of\s+)?(my\s+)?(future\s+)?(projects?|repositories|repos|codebases?)\b|\bacross\s+my\s+(projects?|repositories|repos|codebases?)\b|\bany\s+(project|repository|repo|codebase)\b|\bno matter which\s+(project|repository|repo|codebase)\b|\bwhatever\s+(project|repository|repo|codebase)\b|\bregardless of\s+(the\s+)?(project|repository|repo|codebase)\b|\bin every project\b|\bacross all my work\b`)
 
 // IsTransientInstruction rejects preferences explicitly limited to one reply or task.
 func IsTransientInstruction(userMessage string) bool {
@@ -49,15 +50,7 @@ func DetectExplicitGlobalPreference(userMessage string) bool {
 	if IsTransientInstruction(userMessage) {
 		return false
 	}
-	lower := strings.ToLower(userMessage)
-	durable := strings.Contains(lower, "prefer") || strings.Contains(lower, "preference") ||
-		strings.Contains(lower, "for future") || strings.Contains(lower, "i like")
-	crossProject := strings.Contains(lower, "across all projects") || strings.Contains(lower, "across my projects") ||
-		strings.Contains(lower, "across every project") || strings.Contains(lower, "in every project") ||
-		strings.Contains(lower, "for every project") || strings.Contains(lower, "any project") ||
-		strings.Contains(lower, "any codebase") || strings.Contains(lower, "no matter which project") ||
-		strings.Contains(lower, "across your codebases") || strings.Contains(lower, "in all projects")
-	return durable && crossProject
+	return durablePreferenceRegex.MatchString(userMessage) && globalPreferenceScopeRegex.MatchString(userMessage)
 }
 
 func DetectCorrectionIntent(userMessage string) CorrectionIntent {

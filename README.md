@@ -908,12 +908,20 @@ for gate, final save, and scope. Exact summary text consistency was `0.917`.
 
 The raw Laya global-scope classifier still scored every tested durable
 cross-project preference below its `0.90` cutoff; wording variants did not
-separate the labeled positives and negatives at that threshold. The explicit
-cue override recovered the five durable preference cases, while project-local
-facts stayed local and temporary instructions were blocked. Treat this as a
-narrow, explicitly worded path, not proof that arbitrary preference phrasing is
-handled. Keep adding paraphrases and counterexamples before broadening it or
-changing the global threshold.
+separate the labeled positives and negatives at that threshold. In the expanded
+16-turn raw evaluator, the deployed and candidate prompts each scored 7/16;
+none justified changing the threshold. The explicit cue override recovered
+durable preferences expressed with "whatever repo", "regardless of repo",
+"any repo", and "all my future projects". Treat this as a narrow, explicitly
+worded path, not proof that arbitrary preference phrasing is handled.
+
+A focused real-write-path follow-up ran those four paraphrases alongside a
+saved project-local preference and a transient instruction, three fresh-scope
+trials each. All 15 expected durable saves were retained, all 3 temporary
+instructions were vetoed, and all 18 global/project scope labels matched with
+identical decisions across repeats. This is still a small synthetic set; the
+raw classifier missed the durable preferences, so the observed improvement is
+from the explicit cue override rather than Laya calibration.
 
 Cosine thresholds were unchanged. Across this run, evidence cosine was
 `0.784`–`0.861` in 9 observations and target similarity was `0.880`–`0.908` in 6

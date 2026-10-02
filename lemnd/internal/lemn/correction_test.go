@@ -60,8 +60,16 @@ func TestDetectExplicitGlobalPreference(t *testing.T) {
 		{name: "future convention across my projects", message: "For future code reviews across my projects, lead with risks first.", want: true},
 		{name: "lasting preference no matter which project", message: "No matter which project we're in, use ISO dates; that's my lasting preference.", want: true},
 		{name: "likes in any codebase", message: "Please remember I like examples first in any codebase.", want: true},
+		{name: "whatever repository paraphrase", message: "I like short answers whatever repository I'm working in.", want: true},
+		{name: "regardless of project paraphrase", message: "My preference is metric units regardless of the project.", want: true},
+		{name: "future repos paraphrase", message: "For future work in any repo, I prefer examples before abstractions.", want: true},
+		{name: "all future projects paraphrase", message: "I prefer a concise format for all my future projects.", want: true},
+		{name: "across all my work paraphrase", message: "I usually want concise summaries across all my work.", want: true},
 		{name: "project-specific convention is not global", message: "For this repository, use integration tests.", want: false},
+		{name: "any project topic without preference is not global", message: "The service should be deployable to any project environment.", want: false},
+		{name: "repository preference is local", message: "In this repository, I prefer table-driven unit tests.", want: false},
 		{name: "single answer instruction is not global", message: "For this answer only, keep it brief.", want: false},
+		{name: "temporary phrase dominates global cue", message: "Across all projects, for this one response only, use bullet points.", want: false},
 		{name: "global topic without durable preference is not enough", message: "We changed all projects to use PostgreSQL.", want: false},
 	}
 	for _, test := range tests {
@@ -81,6 +89,8 @@ func TestIsTransientInstruction(t *testing.T) {
 		{message: "For this answer only, keep it short.", want: true},
 		{message: "Use this setting for this task only.", want: true},
 		{message: "Just this time, skip the examples.", want: true},
+		{message: "For this one response, use bullet points.", want: true},
+		{message: "This one time, answer in French.", want: true},
 		{message: "Across all projects, I prefer concise answers.", want: false},
 		{message: "For future reviews, lead with risks.", want: false},
 	}

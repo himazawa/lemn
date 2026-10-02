@@ -71,6 +71,42 @@ LABELED = [
         "Sure, I'll use bullet points for this answer.",
         False,
     ),
+    (
+        "no-matter-which-repo",
+        "Whatever repo I'm in, I prefer answers that start with the result.",
+        "Understood. I'll lead with the result in any repository.",
+        True,
+    ),
+    (
+        "regardless-of-repo",
+        "My preference is metric units regardless of repo.",
+        "Got it. I'll use metric units in every repository.",
+        True,
+    ),
+    (
+        "future-work-any-repo",
+        "For future work in any repo, I prefer examples before abstractions.",
+        "Understood. I'll lead with examples across codebases.",
+        True,
+    ),
+    (
+        "all-future-projects",
+        "I prefer a concise format for all my future projects.",
+        "Understood. I'll keep responses concise in each of your future projects.",
+        True,
+    ),
+    (
+        "global-deployment-fact",
+        "Across all projects, the deployment window is Sunday at 02:00 UTC.",
+        "Understood. The deployment window is Sunday at 02:00 UTC.",
+        False,
+    ),
+    (
+        "any-environment-capability",
+        "Make sure the service can be deployed to any project environment.",
+        "I updated the deployment documentation to cover each project environment.",
+        False,
+    ),
 ]
 
 
