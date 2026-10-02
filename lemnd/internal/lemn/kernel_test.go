@@ -3,6 +3,7 @@ package lemn
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 func TestJsonInt(t *testing.T) {
@@ -113,8 +114,36 @@ func TestCosineThresholdSignalBoundary(t *testing.T) {
 
 func TestRevalidationRequiresEvidenceOrUserConfirmation(t *testing.T) {
 	err := RevalidateMemory(context.Background(), nil, 1, RevalidationDecision{})
-	if err == nil || err.Error() != "revalidation requires an evidence note or explicit user confirmation" {
+	if err == nil || err.Error() != "revalidation requires a sourced evidence note or explicit user confirmation" {
 		t.Fatalf("RevalidateMemory() error = %v, want explicit attestation error", err)
+	}
+}
+
+func TestValidateRevalidationDecision(t *testing.T) {
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name     string
+		decision RevalidationDecision
+		wantErr  string
+	}{
+		{name: "explicit confirmation", decision: RevalidationDecision{UserConfirmed: true}},
+		{name: "sourced observed evidence", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(-time.Minute)}},
+		{name: "missing confirmation and evidence", wantErr: "revalidation requires a sourced evidence note or explicit user confirmation"},
+		{name: "missing source", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceObservedAt: now}, wantErr: "an evidence source reference is required with an evidence note"},
+		{name: "missing observation time", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api"}, wantErr: "an evidence observation time is required with an evidence note"},
+		{name: "source without evidence", decision: RevalidationDecision{EvidenceSource: "https://docs.example.test/api"}, wantErr: "evidence source and observation time require an evidence note"},
+		{name: "future observation time", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(time.Second)}, wantErr: "evidence observation time cannot be in the future"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateRevalidationDecision(test.decision, now)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("validateRevalidationDecision() error = %v, want nil", err)
+			}
+			if test.wantErr != "" && (err == nil || err.Error() != test.wantErr) {
+				t.Fatalf("validateRevalidationDecision() error = %v, want %q", err, test.wantErr)
+			}
+		})
 	}
 }
 

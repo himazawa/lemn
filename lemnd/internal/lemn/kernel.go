@@ -19,6 +19,8 @@ type ConfirmationDecision struct {
 
 type RevalidationDecision struct {
 	Evidence            string
+	EvidenceSource      string
+	EvidenceObservedAt  time.Time
 	UserConfirmed       bool
 	Summary             string
 	DependsOn           []int
@@ -242,9 +244,10 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 			    provenance = COALESCE(provenance, '{}'::jsonb) || jsonb_build_object(
 			        'revalidation_reason', $2::text,
 			        'invalidated_by_memory_id', $3::int,
-			        'invalidated_dependency_id', $1
+			        'invalidated_dependency_id', $1,
+			        'invalidated_at', $4::text
 			    )
-			WHERE state = 'AUTHORITATIVE' AND id IN (SELECT id FROM affected)`, targetID, revalidationReason, pendingID); err != nil {
+			WHERE state = 'AUTHORITATIVE' AND id IN (SELECT id FROM affected)`, targetID, revalidationReason, pendingID, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return fmt.Errorf("failed to flag dependent memories for revalidation: %w", err)
 		}
 	}
@@ -267,8 +270,9 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 // explicit user confirmation, while preserving its established relations.
 func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision RevalidationDecision) error {
 	evidence := strings.TrimSpace(decision.Evidence)
-	if evidence == "" && !decision.UserConfirmed {
-		return fmt.Errorf("revalidation requires an evidence note or explicit user confirmation")
+	evidenceSource := strings.TrimSpace(decision.EvidenceSource)
+	if err := validateRevalidationDecision(decision, time.Now()); err != nil {
+		return err
 	}
 
 	newSummary := strings.TrimSpace(decision.Summary)
@@ -300,6 +304,30 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 	}
 	if state != "NEEDS_REVALIDATION" {
 		return fmt.Errorf("memory #%d is not awaiting revalidation (state=%s)", memoryID, state)
+	}
+	var provenance map[string]interface{}
+	if len(provenanceJSON) > 0 {
+		if err := json.Unmarshal(provenanceJSON, &provenance); err != nil {
+			return fmt.Errorf("failed to parse provenance for #%d: %w", memoryID, err)
+		}
+	}
+	if provenance == nil {
+		provenance = make(map[string]interface{})
+	}
+	var invalidatedAt time.Time
+	if rawInvalidatedAt, ok := provenance["invalidated_at"].(string); ok && rawInvalidatedAt != "" {
+		invalidatedAt, err = time.Parse(time.RFC3339Nano, rawInvalidatedAt)
+		if err != nil {
+			return fmt.Errorf("memory #%d has an invalid invalidation timestamp; use explicit user confirmation", memoryID)
+		}
+	}
+	if evidence != "" {
+		if invalidatedAt.IsZero() {
+			return fmt.Errorf("memory #%d has no invalidation timestamp; use explicit user confirmation", memoryID)
+		}
+		if decision.EvidenceObservedAt.Before(invalidatedAt) {
+			return fmt.Errorf("evidence for memory #%d predates its invalidation", memoryID)
+		}
 	}
 
 	dependencies := append([]int(nil), decision.DependsOn...)
@@ -356,19 +384,14 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 		}
 	}
 
-	var provenance map[string]interface{}
-	if len(provenanceJSON) > 0 {
-		if err := json.Unmarshal(provenanceJSON, &provenance); err != nil {
-			return fmt.Errorf("failed to parse provenance for #%d: %w", memoryID, err)
-		}
-	}
-	if provenance == nil {
-		provenance = make(map[string]interface{})
-	}
 	entry := map[string]interface{}{
 		"revalidated_at": time.Now().UTC().Format(time.RFC3339Nano),
 		"user_confirmed": decision.UserConfirmed,
-		"evidence_note":  evidence,
+	}
+	if evidence != "" {
+		entry["evidence_note"] = evidence
+		entry["evidence_source"] = evidenceSource
+		entry["evidence_observed_at"] = decision.EvidenceObservedAt.UTC().Format(time.RFC3339Nano)
 	}
 	if reason, ok := provenance["revalidation_reason"]; ok {
 		entry["reason"] = reason
@@ -378,6 +401,9 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 	}
 	if invalidatedDependency, ok := provenance["invalidated_dependency_id"]; ok {
 		entry["invalidated_dependency_id"] = invalidatedDependency
+	}
+	if invalidatedAt, ok := provenance["invalidated_at"]; ok {
+		entry["invalidated_at"] = invalidatedAt
 	}
 	if newSummary != "" && newSummary != oldSummary {
 		entry["previous_summary"] = oldSummary
@@ -389,6 +415,7 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 	delete(provenance, "revalidation_reason")
 	delete(provenance, "invalidated_by_memory_id")
 	delete(provenance, "invalidated_dependency_id")
+	delete(provenance, "invalidated_at")
 	updatedProvenance, err := json.Marshal(provenance)
 	if err != nil {
 		return fmt.Errorf("failed to encode revalidation provenance for #%d: %w", memoryID, err)
@@ -406,6 +433,30 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 		return fmt.Errorf("failed to restore revalidated memory #%d: %w", memoryID, err)
 	}
 	return tx.Commit()
+}
+
+func validateRevalidationDecision(decision RevalidationDecision, now time.Time) error {
+	evidence := strings.TrimSpace(decision.Evidence)
+	source := strings.TrimSpace(decision.EvidenceSource)
+	if evidence == "" {
+		if source != "" || !decision.EvidenceObservedAt.IsZero() {
+			return fmt.Errorf("evidence source and observation time require an evidence note")
+		}
+		if !decision.UserConfirmed {
+			return fmt.Errorf("revalidation requires a sourced evidence note or explicit user confirmation")
+		}
+		return nil
+	}
+	if source == "" {
+		return fmt.Errorf("an evidence source reference is required with an evidence note")
+	}
+	if decision.EvidenceObservedAt.IsZero() {
+		return fmt.Errorf("an evidence observation time is required with an evidence note")
+	}
+	if decision.EvidenceObservedAt.After(now) {
+		return fmt.Errorf("evidence observation time cannot be in the future")
+	}
+	return nil
 }
 
 func uniqueSortedIDs(ids []int) []int {

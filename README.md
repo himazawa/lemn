@@ -234,7 +234,8 @@ curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $LEMN_SHARED_S
     confirm contradicts ─▶ prior target: CONTRADICTED
     (either) ─▶ target's dependents: NEEDS_REVALIDATION
     NEEDS_REVALIDATION
-      ├── lemn revalidate --evidence <note> ──▶ AUTHORITATIVE
+      ├── lemn revalidate --evidence <note> --evidence-source <ref>
+      │                     --evidence-observed-at <RFC3339> ──▶ AUTHORITATIVE
       ├── lemn revalidate --user-confirmed ────▶ AUTHORITATIVE
       └── lemn reject ─────────────────────────▶ REJECTED
 ```
@@ -245,9 +246,12 @@ writes the graph changes atomically. Confirming a `supersedes`/`contradicts`
 relation recursively marks the target's authoritative dependents
 `NEEDS_REVALIDATION`; they stay out of retrieval until explicitly revalidated
 through `lemn revalidate`. Ordinary `confirm` and
-`sweep --apply` cannot restore them. Revalidation requires an evidence note or
-explicit user confirmation, and any retained dependencies must still be
-authoritative; stale dependencies must be replaced or cleared.
+`sweep --apply` cannot restore them. Revalidation requires either explicit user
+confirmation or an evidence note with a source reference and RFC3339 observation
+time at or after invalidation. Any retained dependencies must still be
+authoritative; stale dependencies must be replaced or cleared. The source
+reference and time are reviewer-supplied attestations: LEMN records them but
+does not fetch or independently verify the source.
 
 Automatic promotion is deliberately narrow, and it is the **extraction model's
 own call** that the daemon rubber-stamps: the daemon applies thresholds to the
@@ -484,7 +488,10 @@ docker compose exec daemon lemn pending
 docker compose exec daemon lemn confirm <id>
 
 # For a dependent memory marked NEEDS_REVALIDATION:
-docker compose exec daemon lemn revalidate --evidence "Current API spec confirms this claim" <id>
+docker compose exec daemon lemn revalidate \
+  --evidence "Current API spec confirms this claim" \
+  --evidence-source "https://docs.example.test/api#claim" \
+  --evidence-observed-at "2026-10-03T12:00:00Z" <id>
 
 curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $SECRET" \
   -H 'Content-Type: application/json' \
@@ -1044,7 +1051,7 @@ export LEMN_POSTGRES_DSN="postgres://lemn:CHANGE_ME@localhost:5432/lemn_kernel?s
 |---|---|
 | `./bin/lemn pending` | Lists `OBSERVED`, legacy `CANDIDATE`, pending, and `NEEDS_REVALIDATION` memories with proposed relations and dependencies |
 | `./bin/lemn confirm <id> [options]` | Promotes a reviewed memory; supports `--relation`, `--target`, `--depends-on id,id`, and `--clear-dependencies` to correct proposals before atomic validation and application |
-| `./bin/lemn revalidate [--evidence note \| --user-confirmed] [--summary text] [--depends-on id,id \| --clear-dependencies] <id>` | Restores a quarantined dependent only with fresh evidence or explicit confirmation; records an audit entry, verifies dependencies, and can revise the claim or its dependency set |
+| `./bin/lemn revalidate [--evidence note --evidence-source ref --evidence-observed-at RFC3339 \| --user-confirmed] [--summary text] [--depends-on id,id \| --clear-dependencies] <id>` | Restores a quarantined dependent only with a sourced, post-invalidation evidence attestation or explicit confirmation; records an audit entry, verifies dependencies, and can revise the claim or dependency set |
 | `./bin/lemn reject <id>` | Marks a reviewable memory `REJECTED`, leaving current authoritative memories in place |
 | `./bin/labeler` | Interactive review of unlabelled turns from the SQLite queue |
 | `./bin/export` | Writes reviewed turns to `data/train.jsonl` and `data/valid.jsonl` |

@@ -196,6 +196,14 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	if invalidation["revalidation_reason"] != "dependency_superseded" || jsonInt(invalidation["invalidated_by_memory_id"]) != replacementID || jsonInt(invalidation["invalidated_dependency_id"]) != dependencyID {
 		t.Fatalf("invalidation provenance = %v, want superseded by #%d", invalidation, replacementID)
 	}
+	invalidatedAtText, ok := invalidation["invalidated_at"].(string)
+	if !ok || invalidatedAtText == "" {
+		t.Fatalf("invalidated_at = %v, want timestamp", invalidation["invalidated_at"])
+	}
+	invalidatedAt, err := time.Parse(time.RFC3339Nano, invalidatedAtText)
+	if err != nil {
+		t.Fatalf("parse invalidated_at %q: %v", invalidatedAtText, err)
+	}
 
 	if err := ConfirmPendingMemory(ctx, db, dependentID); err == nil {
 		t.Fatal("ConfirmPendingMemory() promoted a memory needing revalidation")
@@ -213,6 +221,14 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	if err := RevalidateMemory(ctx, db, dependentID, RevalidationDecision{UserConfirmed: true}); err == nil {
 		t.Fatal("RevalidateMemory() accepted a stale dependency without replacing it")
 	}
+	staleEvidence := RevalidationDecision{
+		Evidence:           "The old HTTP/1 specification still mentions this endpoint.",
+		EvidenceSource:     "https://docs.example.test/old-api",
+		EvidenceObservedAt: invalidatedAt.Add(-time.Second),
+	}
+	if err := RevalidateMemory(ctx, db, dependentID, staleEvidence); err == nil {
+		t.Fatal("RevalidateMemory() accepted evidence observed before invalidation")
+	}
 
 	before, err := QueryAuthoritativeMemories(ctx, db, "legacy HTTP/1 integration endpoint", projectID, 5)
 	if err != nil {
@@ -226,6 +242,8 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 
 	decision := RevalidationDecision{
 		Evidence:            "Current API guidance confirms the HTTP/2 test endpoint.",
+		EvidenceSource:      "https://docs.example.test/current-api#http2",
+		EvidenceObservedAt:  time.Now().UTC(),
 		Summary:             "Integration tests now invoke the HTTP/2 endpoint.",
 		DependsOn:           []int{replacementID},
 		ReplaceDependencies: true,
@@ -252,7 +270,7 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 		t.Fatalf("revalidation_history = %v, want one audit entry", revalidated["revalidation_history"])
 	}
 	entry, ok := history[0].(map[string]interface{})
-	if !ok || entry["reason"] != "dependency_superseded" || jsonInt(entry["invalidated_by_memory_id"]) != replacementID || jsonInt(entry["invalidated_dependency_id"]) != dependencyID || entry["evidence_note"] != decision.Evidence || entry["user_confirmed"] != false {
+	if !ok || entry["reason"] != "dependency_superseded" || jsonInt(entry["invalidated_by_memory_id"]) != replacementID || jsonInt(entry["invalidated_dependency_id"]) != dependencyID || entry["evidence_note"] != decision.Evidence || entry["evidence_source"] != decision.EvidenceSource || entry["evidence_observed_at"] != decision.EvidenceObservedAt.Format(time.RFC3339Nano) || entry["invalidated_at"] != invalidatedAtText || entry["user_confirmed"] != false {
 		t.Fatalf("revalidation history entry = %v, missing attestation or invalidation details", history[0])
 	}
 	var remainingDependencies int
