@@ -19,9 +19,10 @@ type ModelExtraction struct {
 	GlobalScoped           bool          `json:"global_scoped"` // user-level preference rather than a project fact
 	Type                   string        `json:"type"`          // "decision", "architecture", "bug_fix", "none"
 	Summary                string        `json:"summary"`
-	Confidence             float64       `json:"confidence"`       // 0.0 - 1.0
-	GateProbability        float64       `json:"gate_probability"` // Laya's memory-worthiness probability
-	Relation               string        `json:"relation"`         // "independent", "supersedes", or "contradicts"
+	Confidence             float64       `json:"confidence"`         // 0.0 - 1.0
+	GateProbability        float64       `json:"gate_probability"`   // Laya's memory-worthiness probability
+	GlobalProbability      float64       `json:"global_probability"` // Laya's user-preference probability
+	Relation               string        `json:"relation"`           // "independent", "supersedes", or "contradicts"
 	TargetID               int           `json:"target_id"`
 	DependsOn              []int         `json:"depends_on"`
 	DependencyCandidateIDs []int         `json:"-"`

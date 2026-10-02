@@ -848,33 +848,57 @@ scoped memories at the end. `/jobs/{id}` is an authenticated read-only endpoint
 used to wait for a durable job and inspect its extraction result; it never
 returns the submitted turn payload.
 
-The labeled cases in `scripts/memory_write_bench_cases.jsonl` cover a durable
-decision, a tool-backed change with an existing fact to supersede, a lookup,
-acknowledgement, conversation recap, and tentative idea. Validate without
-starting services, then run from the repository root with Docker Compose,
-Postgres, Laya, and the model/embedding endpoint available:
+The labeled cases in `scripts/memory_write_bench_cases.jsonl` cover durable
+decisions and preferences, explicit corrections, tool-backed changes, simple
+and tool-backed lookups, acknowledgements, recaps, tentative ideas, and
+one-answer-only instructions. `--repeats N` runs every case N times in fresh
+scopes and reseeds any starting memory for each trial, so one extraction cannot
+affect the next. Validate without starting services, then run from the
+repository root with Docker Compose, Postgres, Laya, and the model/embedding
+endpoint available:
 
 ```bash
 set -a; source .env; set +a
 python3 scripts/memory_write_bench.py --validate-only
-python3 scripts/memory_write_bench.py --out /tmp/lemn-memory-write-bench
+python3 scripts/memory_write_bench.py --repeats 3 \
+  --out /tmp/lemn-memory-write-bench
 ```
 
 The report separates **gate** precision/recall from **final memory**
-precision/recall, and includes extractor vetoes, summary term checks, and
-expected relation checks. It writes detailed per-case extraction and created
-memory provenance to `write-results.json`. These are small hand-labeled examples,
-so treat the scores as diagnostics rather than a calibrated quality estimate.
+precision/recall, and includes extractor vetoes, summary term checks, global
+scope checks, relation checks, and descriptive evidence/target cosine
+distributions. It writes detailed per-case extraction and created-memory
+provenance to `write-results.json`. These are hand-labeled examples, so treat
+the scores as diagnostics rather than a calibrated quality estimate.
 
-On 2026-10-02, one six-case run had gate precision `0.67` and recall `1.00`:
-both positive cases passed the gate, while one lookup also passed. The extractor
-vetoed that lookup, yielding final memory precision and recall of `1.00` on this
-small set. Both positive summaries and both expected relations matched. For the
-tool-backed supersede, evidence cosine was `0.784` and target similarity was
-`0.880`, above the existing `0.60` and `0.82` thresholds. This is one positive
-cosine case, not enough evidence to retune either cutoff. The run also exposed a
-malformed optional `depends_on` value from the model; the daemon now logs and
-ignores malformed dependency hints rather than discarding the whole extraction.
+The initial six-case smoke run on 2026-10-02 had gate precision `0.67` and recall
+`1.00`; the extractor vetoed the one lookup that passed the gate. Its tool-backed
+supersede scored `0.784` evidence cosine and `0.880` target similarity, above the
+existing `0.60` and `0.82` cutoffs. It also exposed malformed optional
+`depends_on` output, which the daemon now logs and ignores instead of dropping
+the entire extraction.
+
+An expanded 11-case, three-repeat run had gate precision `0.625` and recall
+`1.00`; final memory precision was `1.00` and recall `0.80`. The gate passed all
+15 positive trials, but also passed 9/18 negative trials. The extractor vetoed
+all 9 gate false positives, but also vetoed the durable preference on all three
+repeats. That preference received memory-gate probability `0.7948` and global
+probability `0.8395`, yet produced no memory. A separate three-repeat check
+confirmed both durable and one-answer-only style requests were marked
+project-scoped (`global_scoped=false`): their global probabilities were
+`0.8395` and `0.8044`, below the `0.90` cutoff. Thus the durable preference
+misses both at extraction and at global-scope classification, while the
+temporary request is correctly not made global but still passes the broad
+worthiness gate (`0.7392`) before being vetoed. These point to separate areas
+to investigate: extractor preference handling, global preference detection,
+and specificity in the broad worthiness gate. This is a small labeled set, not
+a reason to move thresholds yet.
+
+Across the tool-backed cases, evidence cosine ranged from `0.784` to `0.856`
+(mean `0.830`); target similarity ranged from `0.880` to `0.890` (mean `0.885`).
+The cosine thresholds remain unchanged. Three repeats of this small synthetic
+case set are useful for checking run stability, but not enough independent
+examples to calibrate similarity cutoffs.
 
 ## Running without Docker
 

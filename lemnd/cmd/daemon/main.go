@@ -308,32 +308,36 @@ func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
 	return nil
 }
 
-func rejectedByWorthinessGate(probability float64) lemn.ModelExtraction {
+func rejectedByWorthinessGate(probability, globalProbability float64, globallyApplicable bool) lemn.ModelExtraction {
 	return lemn.ModelExtraction{
-		MemoryWorthy:    false,
-		GatePassed:      false,
-		Type:            "none",
-		GateProbability: probability,
+		MemoryWorthy:      false,
+		GatePassed:        false,
+		GlobalScoped:      globallyApplicable,
+		Type:              "none",
+		GateProbability:   probability,
+		GlobalProbability: globalProbability,
 	}
 }
 
-func rejectedByExtractor(gateProbability, extractionConfidence float64) lemn.ModelExtraction {
+func rejectedByExtractor(gateProbability, globalProbability, extractionConfidence float64, globallyApplicable bool) lemn.ModelExtraction {
 	return lemn.ModelExtraction{
-		MemoryWorthy:    false,
-		GatePassed:      true,
-		Type:            "none",
-		Confidence:      extractionConfidence,
-		GateProbability: gateProbability,
+		MemoryWorthy:      false,
+		GatePassed:        true,
+		GlobalScoped:      globallyApplicable,
+		Type:              "none",
+		Confidence:        extractionConfidence,
+		GateProbability:   gateProbability,
+		GlobalProbability: globalProbability,
 	}
 }
 
 func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtraction, error) {
-	memoryWorthy, probability, globallyApplicable, err := decideMemoryWorthiness(t)
+	memoryWorthy, probability, globallyApplicable, globalProbability, err := decideMemoryWorthiness(t)
 	if err != nil {
 		return lemn.ModelExtraction{}, err
 	}
 	if !memoryWorthy {
-		return rejectedByWorthinessGate(probability), nil
+		return rejectedByWorthinessGate(probability, globalProbability, globallyApplicable), nil
 	}
 
 	scope := lemn.NormalizeScope(t.ProjectID)
@@ -432,7 +436,7 @@ Authoritative memories eligible as dependencies (same scope or global):
 	// Type "none" is the extraction model's own veto: Laya thought the turn
 	// was worth a look, but there was no durable claim in it to store.
 	if payload.Type == "" || payload.Type == "none" || lemn.IsMetaSummary(payload.Summary) {
-		return rejectedByExtractor(probability, payload.Confidence), nil
+		return rejectedByExtractor(probability, globalProbability, payload.Confidence, globallyApplicable), nil
 	}
 
 	relation := "independent"
@@ -461,6 +465,7 @@ Authoritative memories eligible as dependencies (same scope or global):
 		MemoryWorthy:           true,
 		GatePassed:             true,
 		GlobalScoped:           globallyApplicable,
+		GlobalProbability:      globalProbability,
 		Type:                   payload.Type,
 		Summary:                payload.Summary,
 		Confidence:             payload.Confidence,
@@ -595,7 +600,7 @@ func validateRelationChoice(relation string, targetID int, candidates []lemn.Mat
 
 // Returns memory-worthiness, its probability, and whether the turn is a
 // user-level preference that should be stored in the global scope.
-func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, error) {
+func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, float64, error) {
 	reqBody, _ := json.Marshal(map[string]string{
 		"user_message":       t.UserMessage,
 		"assistant_response": t.AssistantResponse,
@@ -603,7 +608,7 @@ func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, error) {
 
 	req, err := http.NewRequest(http.MethodPost, layaMemoryURL, bytes.NewBuffer(reqBody))
 	if err != nil {
-		return false, 0, false, fmt.Errorf("failed to build memory-worthiness request: %w", err)
+		return false, 0, false, 0, fmt.Errorf("failed to build memory-worthiness request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+sharedSecret)
@@ -611,13 +616,13 @@ func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, error) {
 	client := http.Client{Timeout: getenvDuration("LEMN_LAYA_TIMEOUT", 60*time.Second)}
 	resp, err := client.Do(req)
 	if err != nil {
-		return false, 0, false, fmt.Errorf("memory-worthiness request failed: %w", err)
+		return false, 0, false, 0, fmt.Errorf("memory-worthiness request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return false, 0, false, fmt.Errorf("memory-worthiness API returned status %d: %s", resp.StatusCode, string(body))
+		return false, 0, false, 0, fmt.Errorf("memory-worthiness API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -627,7 +632,7 @@ func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, error) {
 		GlobalProbability  float64 `json:"global_probability"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return false, 0, false, fmt.Errorf("memory-worthiness decode failed: %w", err)
+		return false, 0, false, 0, fmt.Errorf("memory-worthiness decode failed: %w", err)
 	}
 
 	if result.MemoryWorthy {
@@ -635,5 +640,5 @@ func decideMemoryWorthiness(t lemn.TurnPayload) (bool, float64, bool, error) {
 			t.ID, result.Probability, result.GloballyApplicable, result.GlobalProbability)
 	}
 
-	return result.MemoryWorthy, result.Probability, result.GloballyApplicable, nil
+	return result.MemoryWorthy, result.Probability, result.GloballyApplicable, result.GlobalProbability, nil
 }

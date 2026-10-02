@@ -113,14 +113,14 @@ func TestValidateRelationChoice(t *testing.T) {
 }
 
 func TestRejectionStagesRemainDistinct(t *testing.T) {
-	gateReject := rejectedByWorthinessGate(0.21)
-	if gateReject.MemoryWorthy || gateReject.GatePassed || gateReject.GateProbability != 0.21 || gateReject.Confidence != 0 {
-		t.Fatalf("gate rejection = %+v, want rejected gate probability preserved without extraction confidence", gateReject)
+	gateReject := rejectedByWorthinessGate(0.21, 0.73, true)
+	if gateReject.MemoryWorthy || gateReject.GatePassed || gateReject.GateProbability != 0.21 || gateReject.GlobalProbability != 0.73 || !gateReject.GlobalScoped || gateReject.Confidence != 0 {
+		t.Fatalf("gate rejection = %+v, want gate/global probabilities preserved without extraction confidence", gateReject)
 	}
 
-	extractorVeto := rejectedByExtractor(0.72, 0.93)
-	if extractorVeto.MemoryWorthy || !extractorVeto.GatePassed || extractorVeto.GateProbability != 0.72 || extractorVeto.Confidence != 0.93 {
-		t.Fatalf("extractor veto = %+v, want gate pass and both probabilities preserved", extractorVeto)
+	extractorVeto := rejectedByExtractor(0.72, 0.81, 0.93, true)
+	if extractorVeto.MemoryWorthy || !extractorVeto.GatePassed || extractorVeto.GateProbability != 0.72 || extractorVeto.GlobalProbability != 0.81 || !extractorVeto.GlobalScoped || extractorVeto.Confidence != 0.93 {
+		t.Fatalf("extractor veto = %+v, want gate/global predictions and extraction confidence preserved", extractorVeto)
 	}
 }
 

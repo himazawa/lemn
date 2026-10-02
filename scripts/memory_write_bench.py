@@ -101,33 +101,39 @@ def vector_sql(vector: list[float]) -> str:
     return "[" + ",".join(f"{value:.9g}" for value in vector) + "]"
 
 
-def seed_existing_memories(cases: list[dict[str, Any]], scopes: dict[str, str], run_id: str, args: argparse.Namespace, headers: dict[str, str]) -> dict[str, list[int]]:
+def scope_key(case_id: str, repeat: int) -> str:
+    return f"{case_id}#repeat-{repeat}"
+
+
+def seed_existing_memories(case_runs: list[tuple[dict[str, Any], int]], scopes: dict[str, str], run_id: str, args: argparse.Namespace, headers: dict[str, str]) -> dict[str, list[int]]:
     statements = ["BEGIN;"]
     ids_by_case: dict[str, list[int]] = {}
     expected_count = 0
-    for case in cases:
+    for case, repeat in case_runs:
+        key = scope_key(case["id"], repeat)
         case_ids = []
         for summary in case.get("initial_memories", []):
             vector = vector_sql(embed(summary, args, headers))
-            provenance = json.dumps({"write_bench_run": run_id, "case_id": case["id"], "fixture": True}, separators=(",", ":"))
+            provenance = json.dumps({"write_bench_run": run_id, "case_id": case["id"], "repeat": repeat, "fixture": True}, separators=(",", ":"))
             statements.append(
                 "INSERT INTO lemn_memories "
                 "(state, project_id, confidence, category, summary, rationale, embedding, provenance) VALUES ("
-                f"'AUTHORITATIVE', {sql_literal(scopes[case['id']])}, 1.0, 'architecture', "
+                f"'AUTHORITATIVE', {sql_literal(scopes[key])}, 1.0, 'architecture', "
                 f"{sql_literal(summary)}, 'write benchmark starting fact', {sql_literal(vector)}::vector, "
                 f"{sql_literal(provenance)}::jsonb) RETURNING id;"
             )
             expected_count += 1
-        ids_by_case[case["id"]] = case_ids
+        ids_by_case[key] = case_ids
     statements.append("COMMIT;")
     returned = run_psql("\n".join(statements))
     if len(returned) != expected_count or any(not value.isdigit() for value in returned):
         cleanup_memories(scopes)
         raise RuntimeError(f"expected {expected_count} initial memory IDs, received {returned}")
     index = 0
-    for case in cases:
+    for case, repeat in case_runs:
+        key = scope_key(case["id"], repeat)
         count = len(case.get("initial_memories", []))
-        ids_by_case[case["id"]] = [int(value) for value in returned[index:index + count]]
+        ids_by_case[key] = [int(value) for value in returned[index:index + count]]
         index += count
     return ids_by_case
 
@@ -215,6 +221,9 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
     extractor_vetoes = 0
     summary_checked = summary_passed = 0
     relation_checked = relation_passed = 0
+    global_checked = global_passed = 0
+    evidence_scores: list[float] = []
+    target_scores: list[float] = []
     for row in results:
         case = cases_by_id[row["case_id"]]
         extraction = row.get("extraction") or {}
@@ -248,12 +257,27 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
             relation_checked += 1
             actual_relation = str(extraction.get("relation", "independent"))
             relation_passed += int(actual_relation == case["expected_relation"])
+        if "expected_global_scoped" in case:
+            global_checked += 1
+            global_passed += int(bool(extraction.get("global_scoped")) == case["expected_global_scoped"])
+        for memory in row.get("created_memories", []):
+            signals = memory.get("provenance", {}).get("signals", {})
+            if isinstance(signals.get("evidence_similarity"), (int, float)):
+                evidence_scores.append(float(signals["evidence_similarity"]))
+            if isinstance(signals.get("target_similarity"), (int, float)):
+                target_scores.append(float(signals["target_similarity"]))
     gate_precision = gate_tp / (gate_tp + gate_fp) if gate_tp + gate_fp else 0.0
     gate_recall = gate_tp / (gate_tp + gate_fn) if gate_tp + gate_fn else 0.0
     gate_f1 = 2 * gate_precision * gate_recall / (gate_precision + gate_recall) if gate_precision + gate_recall else 0.0
     final_precision = final_tp / (final_tp + final_fp) if final_tp + final_fp else 0.0
     final_recall = final_tp / (final_tp + final_fn) if final_tp + final_fn else 0.0
     final_f1 = 2 * final_precision * final_recall / (final_precision + final_recall) if final_precision + final_recall else 0.0
+
+    def score_distribution(values: list[float]) -> dict[str, float | int | None]:
+        if not values:
+            return {"count": 0, "mean": None, "min": None, "max": None}
+        return {"count": len(values), "mean": sum(values) / len(values), "min": min(values), "max": max(values)}
+
     return {
         "cases": len(results),
         "gate_true_positive": gate_tp, "gate_false_positive": gate_fp,
@@ -265,16 +289,26 @@ def evaluate(results: list[dict[str, Any]], cases_by_id: dict[str, dict[str, Any
         "extractor_vetoes": extractor_vetoes,
         "summary_terms_passed": summary_passed, "summary_terms_checked": summary_checked,
         "relation_passed": relation_passed, "relation_checked": relation_checked,
+        "global_scope_passed": global_passed, "global_scope_checked": global_checked,
+        "evidence_cosine": score_distribution(evidence_scores),
+        "target_cosine": score_distribution(target_scores),
     }
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
     cases = read_cases(Path(args.cases))
+    if args.case_ids:
+        requested = {item.strip() for item in args.case_ids.split(",") if item.strip()}
+        known = {case["id"] for case in cases}
+        unknown = requested - known
+        if unknown:
+            raise ValueError(f"unknown case IDs: {', '.join(sorted(unknown))}")
+        cases = [case for case in cases if case["id"] in requested]
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     if args.validate_only:
-        seeded_count = sum(len(case.get("initial_memories", [])) for case in cases)
-        print(f"Validated {len(cases)} labeled turns and {seeded_count} optional starting memories; no services will be started.")
+        seeded_count = sum(len(case.get("initial_memories", [])) for case in cases) * args.repeats
+        print(f"Validated {len(cases)} labeled turns across {args.repeats} repeat(s); {seeded_count} optional starting memories; no services will be started.")
         return
 
     secret = os.environ.get(args.shared_secret_env, "")
@@ -286,19 +320,24 @@ def run_benchmark(args: argparse.Namespace) -> None:
         embedding_headers["Authorization"] = f"Bearer {backend_key}"
     auth_headers = {"Content-Type": "application/json", "Authorization": f"Bearer {secret}"}
     run_id = uuid.uuid4().hex[:12]
-    scopes = {case["id"]: f"lemn-writebench-{run_id}-{case['id']}" for case in cases}
+    case_runs = [(case, repeat) for repeat in range(1, args.repeats + 1) for case in cases]
+    scopes = {
+        scope_key(case["id"], repeat): f"lemn-writebench-{run_id}-{case['id']}-r{repeat}"
+        for case, repeat in case_runs
+    }
     container_id = ""
     memory_rows_seeded = False
     results = []
     try:
         container_id, base_url = start_isolated_daemon(run_id, args.startup_timeout)
-        seeded = seed_existing_memories(cases, scopes, run_id, args, embedding_headers)
+        seeded = seed_existing_memories(case_runs, scopes, run_id, args, embedding_headers)
         memory_rows_seeded = True
-        for case in cases:
-            turn_id = f"writebench_{run_id}_{case['id']}"
+        for case, repeat in case_runs:
+            case_scope = scope_key(case["id"], repeat)
+            turn_id = f"writebench_{run_id}_{case['id']}_r{repeat}"
             payload = {
                 "id": turn_id,
-                "project_id": scopes[case["id"]],
+                "project_id": scopes[case_scope],
                 "user_message": case["user_message"],
                 "assistant_response": case["assistant_response"],
                 "tool_calls": case.get("tool_calls", []),
@@ -308,8 +347,9 @@ def run_benchmark(args: argparse.Namespace) -> None:
             if job["status"] != "COMPLETED":
                 results.append({
                     "case_id": case["id"],
+                    "repeat": repeat,
                     "turn_id": turn_id,
-                    "project_id": scopes[case["id"]],
+                    "project_id": scopes[case_scope],
                     "job_id": queued["job_id"],
                     "job_error": job.get("error", f"job status {job['status']}"),
                     "extraction": {},
@@ -318,11 +358,12 @@ def run_benchmark(args: argparse.Namespace) -> None:
                 print(f"{case['id']}: JOB FAILED: {job.get('error', job['status'])}")
                 continue
             extraction = job.get("extraction") or {}
-            memories = read_created_memories(scopes[case["id"]], turn_id)
+            memories = read_created_memories(scopes[case_scope], turn_id)
             results.append({
                 "case_id": case["id"],
+                "repeat": repeat,
                 "turn_id": turn_id,
-                "project_id": scopes[case["id"]],
+                "project_id": scopes[case_scope],
                 "job_id": queued["job_id"],
                 "extraction": extraction,
                 "created_memories": memories,
@@ -356,6 +397,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", default=str(SCRIPT_DIR / "memory_write_bench_cases.jsonl"))
     parser.add_argument("--out", default="/tmp/lemn-memory-write-bench")
+    parser.add_argument("--case-ids", help="comma-separated labeled case IDs to run")
     parser.add_argument("--embeddings-url", default=os.environ.get("LEMN_EMBEDDING_URL", "http://localhost:9001/v1/embeddings"))
     parser.add_argument("--embedding-model", default=os.environ.get("LEMN_EMBEDDING_MODEL", "bge-m3-mlx-fp16"))
     parser.add_argument("--shared-secret-env", default="LEMN_SHARED_SECRET")
@@ -363,10 +405,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=int, default=120)
     parser.add_argument("--job-timeout", type=int, default=300)
     parser.add_argument("--startup-timeout", type=int, default=60)
+    parser.add_argument("--repeats", type=int, default=1, help="independent fresh-scope runs per labeled turn")
     parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
-    if min(args.request_timeout, args.job_timeout, args.startup_timeout) < 1:
-        parser.error("timeouts must be positive")
+    if min(args.request_timeout, args.job_timeout, args.startup_timeout, args.repeats) < 1:
+        parser.error("timeouts and repeats must be positive")
     return args
 
 
