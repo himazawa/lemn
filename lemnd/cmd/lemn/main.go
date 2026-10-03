@@ -47,7 +47,7 @@ func main() {
 		confirmMemories(db, os.Args[2:])
 	case "revalidate":
 		if len(os.Args) < 3 {
-			fmt.Println("Usage: lemn revalidate [--evidence note --evidence-source ref --evidence-observed-at RFC3339 | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <memory_id>")
+			fmt.Println("Usage: lemn revalidate [--evidence-quote passage --evidence-source https_url | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <memory_id>")
 			return
 		}
 		revalidateMemory(db, os.Args[2:])
@@ -68,7 +68,7 @@ func printUsage() {
 	fmt.Println("LEMN Admin CLI")
 	fmt.Println("  lemn pending           - List OBSERVED, CANDIDATE, pending, and revalidation memories")
 	fmt.Println("  lemn confirm <id> [id...] [--relation independent|supersedes|contradicts] [--target id] [--depends-on id,id|--clear-dependencies]")
-	fmt.Println("  lemn revalidate [--evidence note --evidence-source ref --evidence-observed-at RFC3339 | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <id>")
+	fmt.Println("  lemn revalidate [--evidence-quote passage --evidence-source https_url | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <id>")
 	fmt.Println("  lemn reject <id> [id...] - Mark reviewable memories REJECTED")
 	fmt.Println("  lemn sweep [--apply]   - Re-apply auto-review rules to the queue (dry run without --apply)")
 }
@@ -228,7 +228,7 @@ func confirmMemories(db *sql.DB, args []string) {
 }
 
 func revalidateMemory(db *sql.DB, args []string) {
-	flagTakesValue := map[string]bool{"evidence": true, "evidence-source": true, "evidence-observed-at": true, "summary": true, "depends-on": true}
+	flagTakesValue := map[string]bool{"evidence-quote": true, "evidence-source": true, "summary": true, "depends-on": true}
 	var flagArgs, ids []string
 	for index := 0; index < len(args); index++ {
 		arg := args[index]
@@ -249,9 +249,8 @@ func revalidateMemory(db *sql.DB, args []string) {
 
 	flags := flag.NewFlagSet("revalidate", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
-	evidence := flags.String("evidence", "", "evidence note supporting the memory")
-	evidenceSource := flags.String("evidence-source", "", "source reference for the evidence note")
-	evidenceObservedAt := flags.String("evidence-observed-at", "", "RFC3339 time when the evidence source was observed")
+	evidence := flags.String("evidence-quote", "", "exact passage expected to appear in the fetched source")
+	evidenceSource := flags.String("evidence-source", "", "HTTPS source URL on an approved host")
 	userConfirmed := flags.Bool("user-confirmed", false, "record explicit user confirmation")
 	summary := flags.String("summary", "", "replace the memory summary")
 	dependsOn := flags.String("depends-on", "", "replace dependencies with comma-separated memory IDs")
@@ -260,7 +259,7 @@ func revalidateMemory(db *sql.DB, args []string) {
 		return
 	}
 	if len(ids) != 1 {
-		fmt.Fprintln(os.Stderr, "Usage: lemn revalidate [--evidence note --evidence-source ref --evidence-observed-at RFC3339 | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <memory_id>")
+		fmt.Fprintln(os.Stderr, "Usage: lemn revalidate [--evidence-quote passage --evidence-source https_url | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <memory_id>")
 		return
 	}
 	if *dependsOn != "" && *clearDependencies {
@@ -272,21 +271,11 @@ func revalidateMemory(db *sql.DB, args []string) {
 		fmt.Fprintf(os.Stderr, "invalid memory ID %q\n", ids[0])
 		return
 	}
-	var observedAt time.Time
-	if strings.TrimSpace(*evidenceObservedAt) != "" {
-		observedAt, err = time.Parse(time.RFC3339Nano, strings.TrimSpace(*evidenceObservedAt))
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "--evidence-observed-at must be an RFC3339 timestamp")
-			return
-		}
-	}
-
 	decision := lemn.RevalidationDecision{
-		Evidence:           *evidence,
-		EvidenceSource:     *evidenceSource,
-		EvidenceObservedAt: observedAt,
-		UserConfirmed:      *userConfirmed,
-		Summary:            *summary,
+		Evidence:       *evidence,
+		EvidenceSource: *evidenceSource,
+		UserConfirmed:  *userConfirmed,
+		Summary:        *summary,
 	}
 	if *dependsOn != "" || *clearDependencies {
 		decision.ReplaceDependencies = true

@@ -206,6 +206,21 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	if err != nil {
 		t.Fatalf("parse invalidated_at %q: %v", invalidatedAtText, err)
 	}
+	verifierAt := func(observedAt time.Time) evidenceVerifier {
+		return func(_ context.Context, sourceURL, quote string) (verifiedEvidence, error) {
+			sourceBody := "verified test source: " + quote
+			sourceDigest := sha256.Sum256([]byte(sourceBody))
+			quoteDigest := sha256.Sum256([]byte(strings.TrimSpace(quote)))
+			return verifiedEvidence{
+				SourceURL:    sourceURL,
+				Quote:        strings.TrimSpace(quote),
+				ObservedAt:   observedAt,
+				SourceSHA256: hex.EncodeToString(sourceDigest[:]),
+				QuoteSHA256:  hex.EncodeToString(quoteDigest[:]),
+				ContentType:  "text/plain",
+			}, nil
+		}
+	}
 
 	if err := ConfirmPendingMemory(ctx, db, dependentID); err == nil {
 		t.Fatal("ConfirmPendingMemory() promoted a memory needing revalidation")
@@ -223,12 +238,25 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	if err := RevalidateMemory(ctx, db, dependentID, RevalidationDecision{UserConfirmed: true}); err == nil {
 		t.Fatal("RevalidateMemory() accepted a stale dependency without replacing it")
 	}
-	staleEvidence := RevalidationDecision{
-		Evidence:           "The old HTTP/1 specification still mentions this endpoint.",
-		EvidenceSource:     "https://docs.example.test/old-api",
-		EvidenceObservedAt: invalidatedAt.Add(-time.Second),
+	t.Setenv("LEMN_REVALIDATION_ALLOWED_HOSTS", "")
+	unapprovedSource := RevalidationDecision{
+		Evidence:       "Current API guidance confirms the HTTP/2 test endpoint.",
+		EvidenceSource: "https://docs.example.test/current-api#http2",
 	}
-	if err := RevalidateMemory(ctx, db, dependentID, staleEvidence); err == nil {
+	if err := RevalidateMemory(ctx, db, dependentID, unapprovedSource); err == nil || !strings.Contains(err.Error(), "no evidence hosts are approved") {
+		t.Fatalf("RevalidateMemory() with no approved hosts error = %v, want fail-closed allowlist error", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1`, dependentID).Scan(&state); err != nil {
+		t.Fatalf("check state after unapproved-source rejection: %v", err)
+	}
+	if state != "NEEDS_REVALIDATION" {
+		t.Fatalf("state after unapproved-source rejection = %q, want NEEDS_REVALIDATION", state)
+	}
+	staleEvidence := RevalidationDecision{
+		Evidence:       "The old HTTP/1 specification still mentions this endpoint.",
+		EvidenceSource: "https://docs.example.test/old-api",
+	}
+	if err := revalidateMemoryWithVerifier(ctx, db, dependentID, staleEvidence, verifierAt(invalidatedAt.Add(-time.Second))); err == nil {
 		t.Fatal("RevalidateMemory() accepted evidence observed before invalidation")
 	}
 	maxAge := defaultRevalidationEvidenceMaxAge
@@ -249,11 +277,10 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 		t.Fatalf("age invalidation timestamp for stale-evidence case: %v", err)
 	}
 	agedEvidence := RevalidationDecision{
-		Evidence:           "The source was checked after invalidation, but too long ago.",
-		EvidenceSource:     "https://docs.example.test/old-revalidation-window",
-		EvidenceObservedAt: agedEvidenceAt,
+		Evidence:       "The source was checked after invalidation, but too long ago.",
+		EvidenceSource: "https://docs.example.test/old-revalidation-window",
 	}
-	if err := RevalidateMemory(ctx, db, dependentID, agedEvidence); err == nil {
+	if err := revalidateMemoryWithVerifier(ctx, db, dependentID, agedEvidence, verifierAt(agedEvidenceAt)); err == nil {
 		t.Fatal("RevalidateMemory() accepted evidence older than the configured maximum age")
 	}
 	if err := db.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1`, dependentID).Scan(&state); err != nil {
@@ -279,12 +306,12 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	decision := RevalidationDecision{
 		Evidence:            "Current API guidance confirms the HTTP/2 test endpoint.",
 		EvidenceSource:      "https://docs.example.test/current-api#http2",
-		EvidenceObservedAt:  time.Now().UTC(),
 		Summary:             "Integration tests now invoke the HTTP/2 endpoint.",
 		DependsOn:           []int{replacementID},
 		ReplaceDependencies: true,
 	}
-	if err := RevalidateMemory(ctx, db, dependentID, decision); err != nil {
+	acceptedEvidenceAt := time.Now().UTC()
+	if err := revalidateMemoryWithVerifier(ctx, db, dependentID, decision, verifierAt(acceptedEvidenceAt)); err != nil {
 		t.Fatalf("RevalidateMemory() error = %v", err)
 	}
 	var summary string
@@ -306,8 +333,9 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 		t.Fatalf("revalidation_history = %v, want one audit entry", revalidated["revalidation_history"])
 	}
 	entry, ok := history[0].(map[string]interface{})
-	evidenceDigest := sha256.Sum256([]byte(decision.Evidence))
-	if !ok || entry["reason"] != "dependency_superseded" || jsonInt(entry["invalidated_by_memory_id"]) != replacementID || jsonInt(entry["invalidated_dependency_id"]) != dependencyID || entry["evidence_note"] != decision.Evidence || entry["evidence_note_sha256"] != hex.EncodeToString(evidenceDigest[:]) || entry["evidence_source"] != decision.EvidenceSource || entry["evidence_observed_at"] != decision.EvidenceObservedAt.Format(time.RFC3339Nano) || entry["invalidated_at"] != invalidatedAtText || entry["user_confirmed"] != false {
+	sourceDigest := sha256.Sum256([]byte("verified test source: " + decision.Evidence))
+	quoteDigest := sha256.Sum256([]byte(strings.TrimSpace(decision.Evidence)))
+	if !ok || entry["reason"] != "dependency_superseded" || jsonInt(entry["invalidated_by_memory_id"]) != replacementID || jsonInt(entry["invalidated_dependency_id"]) != dependencyID || entry["evidence_note"] != decision.Evidence || entry["evidence_note_sha256"] != hex.EncodeToString(quoteDigest[:]) || entry["evidence_source"] != decision.EvidenceSource || entry["evidence_source_sha256"] != hex.EncodeToString(sourceDigest[:]) || entry["evidence_source_content_type"] != "text/plain" || entry["evidence_observed_at"] != acceptedEvidenceAt.Format(time.RFC3339Nano) || entry["invalidated_at"] != invalidatedAtText || entry["user_confirmed"] != false {
 		t.Fatalf("revalidation history entry = %v, missing attestation or invalidation details", history[0])
 	}
 	var remainingDependencies int
@@ -334,5 +362,33 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	}
 	if !found {
 		t.Fatal("revalidated memory was not restored to authoritative retrieval")
+	}
+
+	manualID := insert("NEEDS_REVALIDATION", "The migration decision was reconfirmed directly with the user.", unitY, map[string]interface{}{
+		"revalidation_reason": "dependency_contradicted",
+		"invalidated_at":      time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano),
+	})
+	if err := RevalidateMemory(ctx, db, manualID, RevalidationDecision{UserConfirmed: true}); err != nil {
+		t.Fatalf("RevalidateMemory() explicit user confirmation error = %v", err)
+	}
+	var manualState string
+	var manualProvenanceJSON []byte
+	if err := db.QueryRowContext(ctx, `SELECT state, provenance FROM lemn_memories WHERE id = $1`, manualID).Scan(&manualState, &manualProvenanceJSON); err != nil {
+		t.Fatalf("load explicitly confirmed memory: %v", err)
+	}
+	var manualProvenance map[string]interface{}
+	if err := json.Unmarshal(manualProvenanceJSON, &manualProvenance); err != nil {
+		t.Fatalf("decode explicit-confirmation provenance: %v", err)
+	}
+	manualHistory, ok := manualProvenance["revalidation_history"].([]interface{})
+	if manualState != "AUTHORITATIVE" || !ok || len(manualHistory) != 1 {
+		t.Fatalf("explicit confirmation state/history = %q/%v, want AUTHORITATIVE/one entry", manualState, manualProvenance["revalidation_history"])
+	}
+	manualEntry, ok := manualHistory[0].(map[string]interface{})
+	if !ok || manualEntry["user_confirmed"] != true {
+		t.Fatalf("explicit confirmation audit = %v, want user_confirmed=true", manualHistory[0])
+	}
+	if _, exists := manualEntry["evidence_source_sha256"]; exists {
+		t.Fatalf("explicit confirmation audit unexpectedly claims source verification: %v", manualEntry)
 	}
 }

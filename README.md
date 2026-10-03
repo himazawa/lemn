@@ -234,8 +234,8 @@ curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $LEMN_SHARED_S
     confirm contradicts ─▶ prior target: CONTRADICTED
     (either) ─▶ target's dependents: NEEDS_REVALIDATION
     NEEDS_REVALIDATION
-      ├── lemn revalidate --evidence <note> --evidence-source <ref>
-      │                     --evidence-observed-at <RFC3339> ──▶ AUTHORITATIVE
+      ├── lemn revalidate --evidence-quote <passage>
+      │                     --evidence-source <approved-https-url> ──▶ AUTHORITATIVE
       ├── lemn revalidate --user-confirmed ────▶ AUTHORITATIVE
       └── lemn reject ─────────────────────────▶ REJECTED
 ```
@@ -247,14 +247,19 @@ relation recursively marks the target's authoritative dependents
 `NEEDS_REVALIDATION`; they stay out of retrieval until explicitly revalidated
 through `lemn revalidate`. Ordinary `confirm` and
 `sweep --apply` cannot restore them. Revalidation requires either explicit user
-confirmation or an evidence note with a source reference and RFC3339 observation
-time at or after invalidation. Any retained dependencies must still be
-authoritative; stale dependencies must be replaced or cleared. The source
-reference and time are reviewer-supplied attestations: LEMN records them and a
-SHA-256 digest of the note, but does not fetch or independently verify the
-source. Evidence must be no older than `LEMN_REVALIDATION_MAX_EVIDENCE_AGE`
-(default `720h`, 30 days); explicit user confirmation is the fallback when
-current source evidence is unavailable.
+confirmation or a quoted passage that LEMN fetches from an allowlisted HTTPS
+host and finds in the visible source text. Fetches reject redirects outside the
+allowlist, private and special-use IP addresses, credentials, non-HTTPS URLs,
+query-bearing URLs, unsupported content types, bodies above 2 MiB, and quotes
+above 16 KiB. LEMN records hashes of the fetched body and cited passage. It uses
+HTTP `Last-Modified` and `Age` when present, otherwise fetch time, and rejects
+evidence observed before invalidation or older than
+`LEMN_REVALIDATION_MAX_EVIDENCE_AGE` (default `720h`, 30 days).
+Any retained dependencies must still be authoritative; stale dependencies must
+be replaced or cleared. A matching quote proves only that the passage appeared
+in the fetched source; it does not prove the source is correct or logically
+supports the memory. If the source cannot be fetched or matched, use explicit
+user confirmation instead.
 
 Automatic promotion is deliberately narrow, and it is the **extraction model's
 own call** that the daemon rubber-stamps: the daemon applies thresholds to the
@@ -489,16 +494,22 @@ Then promote and retrieve it:
 ```bash
 docker compose exec daemon lemn pending
 docker compose exec daemon lemn confirm <id>
-
-# For a dependent memory marked NEEDS_REVALIDATION:
-docker compose exec daemon lemn revalidate \
-  --evidence "Current API spec confirms this claim" \
-  --evidence-source "https://docs.example.test/api#claim" \
-  --evidence-observed-at "2026-10-03T12:00:00Z" <id>
-
 curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $SECRET" \
   -H 'Content-Type: application/json' \
   -d '{"query":"what is our job queue built on?","project_id":"demo","limit":5}'
+```
+
+For source-backed revalidation, configure `LEMN_REVALIDATION_ALLOWED_HOSTS` as
+a comma-separated exact-host allowlist, for example
+`docs.example.test,git.example.test`. Docker CLI invocations inherit this from
+the daemon service environment; when running `./bin/lemn` locally, export the
+same variable in that shell. An empty allowlist disables source fetching; use
+`--user-confirmed` if the source cannot be approved or fetched.
+
+```bash
+docker compose exec daemon lemn revalidate \
+  --evidence-quote "The API uses HTTP/2 for requests." \
+  --evidence-source "https://docs.example.test/api" <id>
 ```
 
 ### 6. Connect Pi
@@ -1059,7 +1070,7 @@ export LEMN_POSTGRES_DSN="postgres://lemn:CHANGE_ME@localhost:5432/lemn_kernel?s
 |---|---|
 | `./bin/lemn pending` | Lists `OBSERVED`, legacy `CANDIDATE`, pending, and `NEEDS_REVALIDATION` memories with proposed relations and dependencies |
 | `./bin/lemn confirm <id> [options]` | Promotes a reviewed memory; supports `--relation`, `--target`, `--depends-on id,id`, and `--clear-dependencies` to correct proposals before atomic validation and application |
-| `./bin/lemn revalidate [--evidence note --evidence-source ref --evidence-observed-at RFC3339 \| --user-confirmed] [--summary text] [--depends-on id,id \| --clear-dependencies] <id>` | Restores a quarantined dependent only with a sourced, post-invalidation evidence attestation or explicit confirmation; records an audit entry, verifies dependencies, and can revise the claim or dependency set |
+| `./bin/lemn revalidate [--evidence-quote passage --evidence-source https_url \| --user-confirmed] [--summary text] [--depends-on id,id \| --clear-dependencies] <id>` | Restores a quarantined dependent only after fetching an allowlisted HTTPS source and finding the quoted passage, or explicit confirmation; records source/body and quote hashes, verifies dependencies, and can revise the claim or dependency set |
 | `./bin/lemn reject <id>` | Marks a reviewable memory `REJECTED`, leaving current authoritative memories in place |
 | `./bin/labeler` | Interactive review of unlabelled turns from the SQLite queue |
 | `./bin/export` | Writes reviewed turns to `data/train.jsonl` and `data/valid.jsonl` |
@@ -1099,7 +1110,8 @@ DELETE FROM lemn_edges WHERE target_id = <id> AND relationship = 'supersedes';
 | `LEMN_SUPERSEDE_THRESHOLD` | `0.82` | daemon |
 | `LEMN_PROMOTE_THRESHOLD` | `0.9` | daemon |
 | `LEMN_AUTO_SUPERSEDE_THRESHOLD` | `0.95` | daemon |
-| `LEMN_REVALIDATION_MAX_EVIDENCE_AGE` | `720h` | daemon |
+| `LEMN_REVALIDATION_MAX_EVIDENCE_AGE` | `720h` | daemon / `cmd/lemn` |
+| `LEMN_REVALIDATION_ALLOWED_HOSTS` | empty (source verification disabled) | daemon / `cmd/lemn` |
 | `LEMN_LAYA_TIMEOUT` | `60s` | daemon |
 | `LEMN_EXTRACTION_TIMEOUT` | `120s` | daemon |
 | `LEMN_SQLITE_PATH` | `./lemn_data.db` | daemon, labeler, export |

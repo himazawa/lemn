@@ -2,9 +2,7 @@ package lemn
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -22,7 +20,6 @@ type ConfirmationDecision struct {
 type RevalidationDecision struct {
 	Evidence            string
 	EvidenceSource      string
-	EvidenceObservedAt  time.Time
 	UserConfirmed       bool
 	Summary             string
 	DependsOn           []int
@@ -272,14 +269,39 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 // RevalidateMemory restores a quarantined memory only after fresh evidence or
 // explicit user confirmation, while preserving its established relations.
 func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision RevalidationDecision) error {
+	return revalidateMemoryWithVerifier(ctx, db, memoryID, decision, verifyEvidenceSource)
+}
+
+func revalidateMemoryWithVerifier(ctx context.Context, db *sql.DB, memoryID int, decision RevalidationDecision, verifier evidenceVerifier) error {
 	evidence := strings.TrimSpace(decision.Evidence)
-	evidenceSource := strings.TrimSpace(decision.EvidenceSource)
-	maxEvidenceAge, err := revalidationEvidenceMaxAge()
-	if err != nil {
+	if err := validateRevalidationDecision(decision); err != nil {
 		return err
 	}
-	if err := validateRevalidationDecision(decision, time.Now(), maxEvidenceAge); err != nil {
-		return err
+	if db == nil {
+		return fmt.Errorf("database is required for revalidation")
+	}
+	var currentState string
+	if err := db.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1`, memoryID).Scan(&currentState); err != nil {
+		return fmt.Errorf("failed to inspect memory #%d before revalidation: %w", memoryID, err)
+	}
+	if currentState != "NEEDS_REVALIDATION" {
+		return fmt.Errorf("memory #%d is not awaiting revalidation (state=%s)", memoryID, currentState)
+	}
+	var verified verifiedEvidence
+	var maxEvidenceAge time.Duration
+	if evidence != "" {
+		var err error
+		maxEvidenceAge, err = revalidationEvidenceMaxAge()
+		if err != nil {
+			return err
+		}
+		if verifier == nil {
+			return fmt.Errorf("source evidence verifier is not configured; use explicit user confirmation")
+		}
+		verified, err = verifier(ctx, strings.TrimSpace(decision.EvidenceSource), evidence)
+		if err != nil {
+			return fmt.Errorf("evidence source verification failed: %w; use explicit user confirmation if the source cannot be verified", err)
+		}
 	}
 
 	newSummary := strings.TrimSpace(decision.Summary)
@@ -329,11 +351,8 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 		}
 	}
 	if evidence != "" {
-		if invalidatedAt.IsZero() {
-			return fmt.Errorf("memory #%d has no invalidation timestamp; use explicit user confirmation", memoryID)
-		}
-		if decision.EvidenceObservedAt.Before(invalidatedAt) {
-			return fmt.Errorf("evidence for memory #%d predates its invalidation", memoryID)
+		if err := validateVerifiedEvidence(verified, invalidatedAt, time.Now().UTC(), maxEvidenceAge); err != nil {
+			return fmt.Errorf("memory #%d: %w", memoryID, err)
 		}
 	}
 
@@ -397,10 +416,14 @@ func RevalidateMemory(ctx context.Context, db *sql.DB, memoryID int, decision Re
 	}
 	if evidence != "" {
 		entry["evidence_note"] = evidence
-		digest := sha256.Sum256([]byte(evidence))
-		entry["evidence_note_sha256"] = hex.EncodeToString(digest[:])
-		entry["evidence_source"] = evidenceSource
-		entry["evidence_observed_at"] = decision.EvidenceObservedAt.UTC().Format(time.RFC3339Nano)
+		entry["evidence_note_sha256"] = verified.QuoteSHA256
+		entry["evidence_source"] = verified.SourceURL
+		entry["evidence_source_sha256"] = verified.SourceSHA256
+		entry["evidence_source_content_type"] = verified.ContentType
+		entry["evidence_observed_at"] = verified.ObservedAt.UTC().Format(time.RFC3339Nano)
+		if verified.LastModifiedAt != nil {
+			entry["evidence_source_last_modified_at"] = verified.LastModifiedAt.UTC().Format(time.RFC3339Nano)
+		}
 	}
 	if reason, ok := provenance["revalidation_reason"]; ok {
 		entry["reason"] = reason
@@ -453,32 +476,45 @@ func revalidationEvidenceMaxAge() (time.Duration, error) {
 	return maxAge, nil
 }
 
-func validateRevalidationDecision(decision RevalidationDecision, now time.Time, maxAge time.Duration) error {
+func validateRevalidationDecision(decision RevalidationDecision) error {
 	evidence := strings.TrimSpace(decision.Evidence)
 	source := strings.TrimSpace(decision.EvidenceSource)
 	if evidence == "" {
-		if source != "" || !decision.EvidenceObservedAt.IsZero() {
-			return fmt.Errorf("evidence source and observation time require an evidence note")
+		if source != "" {
+			return fmt.Errorf("evidence source requires an evidence quote")
 		}
 		if !decision.UserConfirmed {
-			return fmt.Errorf("revalidation requires a sourced evidence note or explicit user confirmation")
+			return fmt.Errorf("revalidation requires a verifiable evidence quote or explicit user confirmation")
 		}
 		return nil
+	}
+	if decision.UserConfirmed {
+		return fmt.Errorf("choose either verified source evidence or explicit user confirmation, not both")
 	}
 	if source == "" {
 		return fmt.Errorf("an evidence source reference is required with an evidence note")
 	}
-	if decision.EvidenceObservedAt.IsZero() {
-		return fmt.Errorf("an evidence observation time is required with an evidence note")
+	return nil
+}
+
+func validateVerifiedEvidence(evidence verifiedEvidence, invalidatedAt, now time.Time, maxAge time.Duration) error {
+	if evidence.SourceURL == "" || evidence.Quote == "" || evidence.SourceSHA256 == "" || evidence.QuoteSHA256 == "" || evidence.ObservedAt.IsZero() {
+		return fmt.Errorf("source verifier returned incomplete evidence metadata; use explicit user confirmation")
 	}
-	if decision.EvidenceObservedAt.After(now) {
-		return fmt.Errorf("evidence observation time cannot be in the future")
+	if invalidatedAt.IsZero() {
+		return fmt.Errorf("no invalidation timestamp is available; use explicit user confirmation")
+	}
+	if evidence.ObservedAt.After(now) {
+		return fmt.Errorf("verified evidence observation time is in the future")
+	}
+	if evidence.ObservedAt.Before(invalidatedAt) {
+		return fmt.Errorf("verified evidence predates invalidation")
 	}
 	if maxAge <= 0 {
 		return fmt.Errorf("maximum evidence age must be positive")
 	}
-	if age := now.Sub(decision.EvidenceObservedAt); age > maxAge {
-		return fmt.Errorf("evidence is older than the maximum age of %s; use explicit user confirmation", maxAge)
+	if age := now.Sub(evidence.ObservedAt); age > maxAge {
+		return fmt.Errorf("verified source evidence is older than the maximum age of %s; use explicit user confirmation", maxAge)
 	}
 	return nil
 }

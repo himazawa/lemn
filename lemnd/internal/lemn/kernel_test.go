@@ -114,36 +114,70 @@ func TestCosineThresholdSignalBoundary(t *testing.T) {
 
 func TestRevalidationRequiresEvidenceOrUserConfirmation(t *testing.T) {
 	err := RevalidateMemory(context.Background(), nil, 1, RevalidationDecision{})
-	if err == nil || err.Error() != "revalidation requires a sourced evidence note or explicit user confirmation" {
+	if err == nil || err.Error() != "revalidation requires a verifiable evidence quote or explicit user confirmation" {
 		t.Fatalf("RevalidateMemory() error = %v, want explicit attestation error", err)
 	}
 }
 
 func TestValidateRevalidationDecision(t *testing.T) {
-	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
-	maxAge := defaultRevalidationEvidenceMaxAge
 	tests := []struct {
 		name     string
 		decision RevalidationDecision
 		wantErr  string
 	}{
 		{name: "explicit confirmation", decision: RevalidationDecision{UserConfirmed: true}},
-		{name: "sourced observed evidence", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(-time.Minute)}},
-		{name: "missing confirmation and evidence", wantErr: "revalidation requires a sourced evidence note or explicit user confirmation"},
-		{name: "missing source", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceObservedAt: now}, wantErr: "an evidence source reference is required with an evidence note"},
-		{name: "missing observation time", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api"}, wantErr: "an evidence observation time is required with an evidence note"},
-		{name: "source without evidence", decision: RevalidationDecision{EvidenceSource: "https://docs.example.test/api"}, wantErr: "evidence source and observation time require an evidence note"},
-		{name: "future observation time", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(time.Second)}, wantErr: "evidence observation time cannot be in the future"},
-		{name: "evidence exceeds maximum age", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", EvidenceObservedAt: now.Add(-maxAge - time.Second)}, wantErr: "evidence is older than the maximum age of 720h0m0s; use explicit user confirmation"},
+		{name: "quoted source evidence", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api"}},
+		{name: "missing confirmation and evidence", wantErr: "revalidation requires a verifiable evidence quote or explicit user confirmation"},
+		{name: "missing source", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2."}, wantErr: "an evidence source reference is required with an evidence note"},
+		{name: "source without quote", decision: RevalidationDecision{EvidenceSource: "https://docs.example.test/api"}, wantErr: "evidence source requires an evidence quote"},
+		{name: "both paths selected", decision: RevalidationDecision{Evidence: "The API spec confirms HTTP/2.", EvidenceSource: "https://docs.example.test/api", UserConfirmed: true}, wantErr: "choose either verified source evidence or explicit user confirmation, not both"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := validateRevalidationDecision(test.decision, now, maxAge)
+			err := validateRevalidationDecision(test.decision)
 			if test.wantErr == "" && err != nil {
 				t.Fatalf("validateRevalidationDecision() error = %v, want nil", err)
 			}
 			if test.wantErr != "" && (err == nil || err.Error() != test.wantErr) {
 				t.Fatalf("validateRevalidationDecision() error = %v, want %q", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateVerifiedEvidence(t *testing.T) {
+	now := time.Date(2026, 10, 3, 12, 0, 0, 0, time.UTC)
+	invalidatedAt := now.Add(-time.Hour)
+	maxAge := 30 * 24 * time.Hour
+	validEvidence := verifiedEvidence{
+		SourceURL:    "https://docs.example.test/api",
+		Quote:        "The API uses HTTP/2.",
+		ObservedAt:   now.Add(-time.Minute),
+		SourceSHA256: "source-hash",
+		QuoteSHA256:  "quote-hash",
+	}
+	tests := []struct {
+		name        string
+		evidence    verifiedEvidence
+		invalidated time.Time
+		maxAge      time.Duration
+		wantErr     string
+	}{
+		{name: "fresh verified quote", evidence: validEvidence, invalidated: invalidatedAt, maxAge: maxAge},
+		{name: "missing hashes", evidence: verifiedEvidence{SourceURL: validEvidence.SourceURL, Quote: validEvidence.Quote, ObservedAt: validEvidence.ObservedAt}, invalidated: invalidatedAt, maxAge: maxAge, wantErr: "source verifier returned incomplete evidence metadata; use explicit user confirmation"},
+		{name: "missing invalidation time", evidence: validEvidence, maxAge: maxAge, wantErr: "no invalidation timestamp is available; use explicit user confirmation"},
+		{name: "source modified before invalidation", evidence: verifiedEvidence{SourceURL: validEvidence.SourceURL, Quote: validEvidence.Quote, ObservedAt: invalidatedAt.Add(-time.Second), SourceSHA256: "source-hash", QuoteSHA256: "quote-hash"}, invalidated: invalidatedAt, maxAge: maxAge, wantErr: "verified evidence predates invalidation"},
+		{name: "source too old", evidence: verifiedEvidence{SourceURL: validEvidence.SourceURL, Quote: validEvidence.Quote, ObservedAt: now.Add(-maxAge - time.Second), SourceSHA256: "source-hash", QuoteSHA256: "quote-hash"}, invalidated: now.Add(-maxAge - 2*time.Second), maxAge: maxAge, wantErr: "verified source evidence is older than the maximum age of 720h0m0s; use explicit user confirmation"},
+		{name: "source clock in future", evidence: verifiedEvidence{SourceURL: validEvidence.SourceURL, Quote: validEvidence.Quote, ObservedAt: now.Add(time.Second), SourceSHA256: "source-hash", QuoteSHA256: "quote-hash"}, invalidated: invalidatedAt, maxAge: maxAge, wantErr: "verified evidence observation time is in the future"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateVerifiedEvidence(test.evidence, test.invalidated, now, test.maxAge)
+			if test.wantErr == "" && err != nil {
+				t.Fatalf("validateVerifiedEvidence() error = %v, want nil", err)
+			}
+			if test.wantErr != "" && (err == nil || err.Error() != test.wantErr) {
+				t.Fatalf("validateVerifiedEvidence() error = %v, want %q", err, test.wantErr)
 			}
 		})
 	}
