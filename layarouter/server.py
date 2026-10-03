@@ -9,8 +9,8 @@ Uses Laya's "noul" question type: a single forward pass returns a
 calibrated P(true) for one yes/no question, rather than free-text
 generation — there's nothing to parse or hallucinate.
 
-IMPORTANT CAVEAT: the 0.5 default threshold below is a starting point,
-not a validated cutoff. The published benchmark numbers for
+IMPORTANT CAVEAT: the thresholds below are project-specific starting points,
+not generally validated cutoffs. The published benchmark numbers for
 `convaiinnovations/laya-typed-decisions` do not validate these custom
 `requires_reasoning` or `memory_worthy` questions, which were written for
 this project rather than trained directly into the model. Log routing and

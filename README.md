@@ -1133,6 +1133,7 @@ DELETE FROM lemn_edges WHERE target_id = <id> AND relationship = 'supersedes';
 | `LAYA_ROUTING_THRESHOLD` | `0.38` | Laya service |
 | `LAYA_MEMORY_THRESHOLD` | `0.45` | Laya service |
 | `LAYA_GLOBAL_THRESHOLD` | `0.90` | Laya service |
+| `LAYA_CORRECTION_THRESHOLD` | `0.5` | Laya service |
 | `LEMN_WORKER_COUNT` | `2` | daemon |
 | `LEMN_POSTGRES_DSN` | required for kernel/admin commands | daemon, `cmd/lemn` |
 | `USE_TF` | `0` | Laya service |
