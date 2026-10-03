@@ -231,6 +231,40 @@ func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) 
 	if err := RevalidateMemory(ctx, db, dependentID, staleEvidence); err == nil {
 		t.Fatal("RevalidateMemory() accepted evidence observed before invalidation")
 	}
+	maxAge := defaultRevalidationEvidenceMaxAge
+	if configuredAge, err := revalidationEvidenceMaxAge(); err != nil {
+		t.Fatalf("read maximum evidence age: %v", err)
+	} else {
+		maxAge = configuredAge
+	}
+	now := time.Now().UTC()
+	agedInvalidation := now.Add(-maxAge - 2*time.Second)
+	agedEvidenceAt := now.Add(-maxAge - time.Second)
+	var agedProvenance []byte
+	if err := db.QueryRowContext(ctx, `
+		UPDATE lemn_memories
+		SET provenance = jsonb_set(provenance, '{invalidated_at}', to_jsonb($1::text))
+		WHERE id = $2
+		RETURNING provenance`, agedInvalidation.Format(time.RFC3339Nano), dependentID).Scan(&agedProvenance); err != nil {
+		t.Fatalf("age invalidation timestamp for stale-evidence case: %v", err)
+	}
+	agedEvidence := RevalidationDecision{
+		Evidence:           "The source was checked after invalidation, but too long ago.",
+		EvidenceSource:     "https://docs.example.test/old-revalidation-window",
+		EvidenceObservedAt: agedEvidenceAt,
+	}
+	if err := RevalidateMemory(ctx, db, dependentID, agedEvidence); err == nil {
+		t.Fatal("RevalidateMemory() accepted evidence older than the configured maximum age")
+	}
+	if err := db.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1`, dependentID).Scan(&state); err != nil {
+		t.Fatalf("check state after expired evidence rejection: %v", err)
+	}
+	if state != "NEEDS_REVALIDATION" {
+		t.Fatalf("state after expired evidence rejection = %q, want NEEDS_REVALIDATION", state)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE lemn_memories SET provenance = $1 WHERE id = $2`, provenanceJSON, dependentID); err != nil {
+		t.Fatalf("restore original invalidation provenance: %v", err)
+	}
 
 	before, err := QueryAuthoritativeMemories(ctx, db, "legacy HTTP/1 integration endpoint", projectID, 5)
 	if err != nil {
