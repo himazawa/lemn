@@ -1,12 +1,16 @@
 # LEMN — Local Epistemic Memory Kernel + Laya Model Router
 
+**Status: experimental prototype, not production-ready.** Current benchmarks are
+synthetic functional checks; they do not establish reliable long-term memory
+quality or improved task outcomes on real-world projects. Treat recalled
+memories as fallible and keep critical project knowledge in version-controlled
+documentation.
+
 LEMN is a local memory service for coding agents, plus an optional model router.
 Its memory kernel manages the lifecycle of candidate facts: worthiness gating,
 extraction, evidence and relation checks, review or promotion, scoped retrieval,
 and supersession/revalidation. It is intended to help agents carry useful,
-corrected project knowledge across sessions; the current benchmarks are
-synthetic functional checks, not evidence of reliable long-term benefit on
-real-world projects.
+corrected project knowledge across sessions.
 
 The optional router independently sends chat requests to a fast or heavy model.
 Everything runs on your machine. Nothing leaves it.
@@ -1120,7 +1124,7 @@ DELETE FROM lemn_edges WHERE target_id = <id> AND relationship = 'supersedes';
 | `LAYA_MODEL_REPO` | `convaiinnovations/laya-typed-decisions` | Laya service |
 | `LAYA_ROUTING_THRESHOLD` | `0.38` | Laya service |
 | `LAYA_MEMORY_THRESHOLD` | `0.45` | Laya service |
-| `LAYA_GLOBAL_THRESHOLD` | `0.67` | Laya service |
+| `LAYA_GLOBAL_THRESHOLD` | `0.90` | Laya service |
 | `LEMN_WORKER_COUNT` | `2` | daemon |
 | `LEMN_POSTGRES_DSN` | required for kernel/admin commands | daemon, `cmd/lemn` |
 | `USE_TF` | `0` | Laya service |

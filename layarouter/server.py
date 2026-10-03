@@ -38,7 +38,7 @@ THRESHOLD = float(os.environ.get("LAYA_ROUTING_THRESHOLD", "0.38"))
 # eval_memory_gate.py): on the labelled set the wording separates the classes
 # at ~0.45, so the default sits at the measured midpoint, not at 0.5.
 MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.45"))
-GLOBAL_THRESHOLD = float(os.environ.get("LAYA_GLOBAL_THRESHOLD", "0.67"))
+GLOBAL_THRESHOLD = float(os.environ.get("LAYA_GLOBAL_THRESHOLD", "0.90"))
 CORRECTION_THRESHOLD = float(os.environ.get("LAYA_CORRECTION_THRESHOLD", "0.5"))
 
 SHARED_SECRET = os.environ.get("LEMN_SHARED_SECRET")
@@ -84,14 +84,8 @@ ROUTING_QUESTIONS = {
 MEMORY_QUESTIONS = {
     "memory_worthy": {
         "type": "noul",
-        # Chosen by measurement (eval_memory_gate.py) over a labelled set of
-        # real traffic. The previous abstract wording ("stable, reusable
-        # information ... likely to matter") left the worth and transient
-        # classes overlapping (separation -0.158); this concrete, contrastive
-        # phrasing — and its 0.45 threshold, as a pair — separates them
-        # (11/12 correct; the one miss is an acknowledgement that the
-        # extraction layer vetoes). Run eval_memory_gate.py --assert after
-        # any change here.
+        # Keep this wording and LAYA_MEMORY_THRESHOLD calibrated together.
+        # Run eval_memory_gate.py --assert after changing either.
         "instructions": (
             "Does this turn establish or change something concrete — a "
             "decision made, a fact confirmed, a preference stated, a mistake "

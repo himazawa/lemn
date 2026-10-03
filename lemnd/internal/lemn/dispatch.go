@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"regexp"
@@ -357,10 +358,9 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 		case shouldAutoConfirm(relation, r.confidence, hasEvidence, r.prov):
 			a.Action, a.Reason = "auto-confirm", fmt.Sprintf("%s #%d, backed by %v", relation, targetID, r.prov["evidence_source"])
 			if apply {
-				filterStaleDependencies(ctx, db, r.scope, r.prov)
-				stampAutoSupersede(MemoryNode{Provenance: r.prov})
-				if a.Err = setStateAndProvenance(ctx, db, r.id, r.state, r.prov); a.Err == nil {
-					a.Err = ConfirmPendingMemory(ctx, db, r.id)
+				if a.Err = filterStaleDependencies(ctx, db, r.scope, r.prov); a.Err == nil {
+					stampAutoSupersede(MemoryNode{Provenance: r.prov})
+					a.Err = persistAndConfirmMemory(ctx, db, r.id, r.state, r.prov)
 				}
 			}
 		case state == "AUTHORITATIVE":
@@ -373,11 +373,10 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 				a.Reason += fmt.Sprintf("; %s dropped, target #%d invalid", proposed, targetID)
 			}
 			if apply {
-				filterStaleDependencies(ctx, db, r.scope, r.prov)
-				r.prov["auto_promoted"] = true
-				r.prov["auto_promote_reason"] = reason
-				if a.Err = setStateAndProvenance(ctx, db, r.id, r.state, r.prov); a.Err == nil {
-					a.Err = ConfirmPendingMemory(ctx, db, r.id)
+				if a.Err = filterStaleDependencies(ctx, db, r.scope, r.prov); a.Err == nil {
+					r.prov["auto_promoted"] = true
+					r.prov["auto_promote_reason"] = reason
+					a.Err = persistAndConfirmMemory(ctx, db, r.id, r.state, r.prov)
 				}
 			}
 		case state != r.state:
@@ -462,6 +461,13 @@ func setStateAndProvenance(ctx context.Context, db *sql.DB, id int, state string
 	return nil
 }
 
+func persistAndConfirmMemory(ctx context.Context, db *sql.DB, id int, state string, prov map[string]interface{}) error {
+	if err := setStateAndProvenance(ctx, db, id, state, prov); err != nil {
+		return err
+	}
+	return ConfirmPendingMemory(ctx, db, id)
+}
+
 // dependencyVisible reports whether a memory in depScope is visible from a
 // memory in scope: same scope, or global from a project scope.
 func dependencyVisible(depScope, scope string) bool {
@@ -474,18 +480,26 @@ func dependencyVisible(depScope, scope string) bool {
 // ConfirmPendingMemory fail; the memory was not authoritative when the
 // dependency flipped, so nothing relied on the edge. Dropped ids are recorded
 // in provenance for audit.
-func filterStaleDependencies(ctx context.Context, db *sql.DB, scope string, prov map[string]interface{}) {
+func filterStaleDependencies(ctx context.Context, db *sql.DB, scope string, prov map[string]interface{}) error {
 	deps := jsonIntSlice(prov["depends_on"])
 	if len(deps) == 0 {
-		return
+		return nil
 	}
 	kept := make([]int, 0, len(deps))
 	var dropped []int
 	for _, id := range deps {
 		var state, depScope string
-		if id <= 0 || db.QueryRowContext(ctx, `SELECT state, project_id FROM lemn_memories WHERE id = $1`, id).Scan(&state, &depScope) != nil {
+		if id <= 0 {
 			dropped = append(dropped, id)
 			continue
+		}
+		err := db.QueryRowContext(ctx, `SELECT state, project_id FROM lemn_memories WHERE id = $1`, id).Scan(&state, &depScope)
+		if errors.Is(err, sql.ErrNoRows) {
+			dropped = append(dropped, id)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("check dependency #%d: %w", id, err)
 		}
 		if state == "AUTHORITATIVE" && dependencyVisible(depScope, scope) {
 			kept = append(kept, id)
@@ -497,4 +511,5 @@ func filterStaleDependencies(ctx context.Context, db *sql.DB, scope string, prov
 	if len(dropped) > 0 {
 		prov["dropped_dependencies"] = dropped
 	}
+	return nil
 }

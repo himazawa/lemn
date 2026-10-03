@@ -1,6 +1,12 @@
 package lemn
 
-import "testing"
+import (
+	"context"
+	"database/sql"
+	"testing"
+
+	_ "modernc.org/sqlite"
+)
 
 func TestExtractionState(t *testing.T) {
 	tests := []struct {
@@ -185,6 +191,42 @@ func TestDependencyVisible(t *testing.T) {
 		if got := dependencyVisible(tc.depScope, tc.scope); got != tc.want {
 			t.Errorf("dependencyVisible(%q, %q) = %v, want %v", tc.depScope, tc.scope, got, tc.want)
 		}
+	}
+}
+
+func TestFilterStaleDependencies(t *testing.T) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE lemn_memories (id INTEGER PRIMARY KEY, state TEXT, project_id TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO lemn_memories (id, state, project_id) VALUES (1, 'AUTHORITATIVE', 'global'), (2, 'NEEDS_REVALIDATION', 'project')`); err != nil {
+		t.Fatal(err)
+	}
+
+	provenance := map[string]interface{}{"depends_on": []int{1, 2, 3, 0}}
+	if err := filterStaleDependencies(context.Background(), db, "project", provenance); err != nil {
+		t.Fatalf("filterStaleDependencies() error = %v", err)
+	}
+	if got := jsonIntSlice(provenance["depends_on"]); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("depends_on = %v, want [1]", got)
+	}
+	if got := jsonIntSlice(provenance["dropped_dependencies"]); len(got) != 3 || got[0] != 2 || got[1] != 3 || got[2] != 0 {
+		t.Fatalf("dropped_dependencies = %v, want [2 3 0]", got)
+	}
+
+	if _, err := db.Exec(`DROP TABLE lemn_memories`); err != nil {
+		t.Fatal(err)
+	}
+	provenance = map[string]interface{}{"depends_on": []int{1}}
+	if err := filterStaleDependencies(context.Background(), db, "project", provenance); err == nil {
+		t.Fatal("filterStaleDependencies() error = nil, want database error")
+	}
+	if got := jsonIntSlice(provenance["depends_on"]); len(got) != 1 || got[0] != 1 {
+		t.Fatalf("depends_on after database error = %v, want [1]", got)
 	}
 }
 

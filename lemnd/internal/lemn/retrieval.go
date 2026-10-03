@@ -120,9 +120,10 @@ func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string
 	candidates := []RetrievedMemory{}
 	for rows.Next() {
 		var m RetrievedMemory
-		if err := rows.Scan(&m.ID, &m.ProjectID, &m.Category, &m.Summary, &m.Similarity); err == nil {
-			candidates = append(candidates, m)
+		if err := rows.Scan(&m.ID, &m.ProjectID, &m.Category, &m.Summary, &m.Similarity); err != nil {
+			return nil, fmt.Errorf("scan vector similarity candidate: %w", err)
 		}
+		candidates = append(candidates, m)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("vector similarity iteration failed: %w", err)

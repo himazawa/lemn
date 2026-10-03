@@ -117,6 +117,83 @@ func TestRouteExtractionAutoPromotionWritesDependencyEdges(t *testing.T) {
 	}
 }
 
+func TestSweepPendingAppliesPromoteAndAutoConfirm(t *testing.T) {
+	dsn := os.Getenv("LEMN_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("set LEMN_TEST_POSTGRES_DSN to an isolated database initialized from schema.sql")
+	}
+	t.Setenv("LEMN_PROMOTE_THRESHOLD", "0.9")
+	t.Setenv("LEMN_AUTO_SUPERSEDE_THRESHOLD", "0.95")
+
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		t.Fatalf("open test Postgres: %v", err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	projectID := fmt.Sprintf("sweep-promotion-test-%d", time.Now().UnixNano())
+	defer func() {
+		_, _ = db.ExecContext(ctx, `DELETE FROM lemn_edges WHERE source_id IN (SELECT id FROM lemn_memories WHERE project_id = $1) OR target_id IN (SELECT id FROM lemn_memories WHERE project_id = $1)`, projectID)
+		_, _ = db.ExecContext(ctx, `DELETE FROM lemn_memories WHERE project_id = $1`, projectID)
+	}()
+	vector := "[1," + strings.TrimSuffix(strings.Repeat("0,", 1023), ",") + "]"
+	insert := func(state string, confidence float64, summary string, provenance map[string]interface{}) int {
+		t.Helper()
+		provenanceJSON, err := json.Marshal(provenance)
+		if err != nil {
+			t.Fatalf("encode provenance: %v", err)
+		}
+		var id int
+		err = db.QueryRowContext(ctx, `
+			INSERT INTO lemn_memories (state, project_id, confidence, category, summary, rationale, embedding, provenance)
+			VALUES ($1, $2, $3, 'architecture', $4, 'sweep test fixture', $5::vector, $6::jsonb)
+			RETURNING id`, state, projectID, confidence, summary, vector, provenanceJSON).Scan(&id)
+		if err != nil {
+			t.Fatalf("insert %s fixture: %v", state, err)
+		}
+		return id
+	}
+
+	targetID := insert("AUTHORITATIVE", 1, "The API uses HTTP/1.", map[string]interface{}{})
+	promoteID := insert("CANDIDATE", 0.99, "The API timeout is 30 seconds.", map[string]interface{}{})
+	autoConfirmID := insert("PENDING_CONFIRMATION", 0.99, "The API now uses HTTP/2.", map[string]interface{}{
+		"proposed_relation":  "supersedes",
+		"proposed_target_id": targetID,
+		"evidence_source":    "test evidence",
+	})
+
+	actions, err := SweepPending(ctx, db, true)
+	if err != nil {
+		t.Fatalf("SweepPending() error = %v", err)
+	}
+	wantActions := map[int]string{promoteID: "promote", autoConfirmID: "auto-confirm"}
+	for _, action := range actions {
+		want, ok := wantActions[action.ID]
+		if !ok {
+			continue
+		}
+		if action.Action != want || action.Err != nil {
+			t.Errorf("SweepPending() action for #%d = (%q, %v), want (%q, nil)", action.ID, action.Action, action.Err, want)
+		}
+		delete(wantActions, action.ID)
+	}
+	if len(wantActions) != 0 {
+		t.Fatalf("SweepPending() did not return actions for %v", wantActions)
+	}
+
+	for id, wantState := range map[int]string{promoteID: "AUTHORITATIVE", autoConfirmID: "AUTHORITATIVE", targetID: "SUPERSEDED"} {
+		var state string
+		if err := db.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1`, id).Scan(&state); err != nil {
+			t.Fatalf("load state for #%d: %v", id, err)
+		}
+		if state != wantState {
+			t.Errorf("state for #%d = %q, want %q", id, state, wantState)
+		}
+	}
+}
+
 func TestRevalidationRequiresExplicitAttestationAndPreservesAudit(t *testing.T) {
 	dsn := os.Getenv("LEMN_TEST_POSTGRES_DSN")
 	if dsn == "" {

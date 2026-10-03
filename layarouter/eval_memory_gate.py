@@ -42,7 +42,7 @@ import sys
 import laya
 
 MODEL_REPO = os.environ.get("LAYA_MODEL_REPO", "convaiinnovations/laya-typed-decisions")
-THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.5"))
+THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.45"))
 
 # (name, user_message, assistant_response, want_worthy, is_anchor)
 #

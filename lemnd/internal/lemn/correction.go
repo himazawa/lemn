@@ -84,9 +84,10 @@ func findSimilarAuthoritative(ctx context.Context, db *sql.DB, embedding []float
 	var matches []MatchTarget
 	for rows.Next() {
 		var m MatchTarget
-		if err := rows.Scan(&m.ID, &m.Summary, &m.Similarity); err == nil {
-			matches = append(matches, m)
+		if err := rows.Scan(&m.ID, &m.Summary, &m.Similarity); err != nil {
+			return nil, fmt.Errorf("scan relation candidate: %w", err)
 		}
+		matches = append(matches, m)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
