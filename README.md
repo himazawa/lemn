@@ -1,5 +1,7 @@
 # LEMN — Local Epistemic Memory Kernel + Laya Model Router
 
+<img width="1024" height="512" alt="lemn_logo" src="https://github.com/user-attachments/assets/cf0358c6-ebdc-4ded-ade7-5e1660b8b214" />
+
 **Status: experimental prototype, not production-ready.** Current benchmarks are
 synthetic functional checks; they do not establish reliable long-term memory
 quality or improved task outcomes on real-world projects. Treat recalled
