@@ -1190,3 +1190,12 @@ If you are not comfortable using software developed with significant AI assistan
 | First turn takes a minute, later ones are fast | Normal prompt prefill. Enable your model server's prompt cache |
 | Config edits appear ignored | You ran `source .env` in that shell; exported variables override the `.env` file for Compose |
 
+## License
+
+Unless otherwise noted, LEMN's original source code and documentation are
+licensed under the GNU Affero General Public License, version 3 only
+(AGPL-3.0-only); see [LICENSE](LICENSE). AGPL permits commercial use and does
+not require payment merely because a project earns money. Third-party
+dependencies, model checkpoints, container images, and external services are
+governed by their own terms.
+

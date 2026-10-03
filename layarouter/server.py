@@ -41,7 +41,7 @@ MEMORY_THRESHOLD = float(os.environ.get("LAYA_MEMORY_THRESHOLD", "0.45"))
 GLOBAL_THRESHOLD = float(os.environ.get("LAYA_GLOBAL_THRESHOLD", "0.90"))
 CORRECTION_THRESHOLD = float(os.environ.get("LAYA_CORRECTION_THRESHOLD", "0.5"))
 
-SHARED_SECRET = os.environ.get("LEMN_SHARED_SECRET")
+SHARED_SECRET = os.environ.get("LEMN_SHARED_SECRET", "")
 if not SHARED_SECRET:
     raise RuntimeError(
         "LEMN_SHARED_SECRET is not set — refusing to start unauthenticated. "
