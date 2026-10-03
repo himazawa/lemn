@@ -1,23 +1,44 @@
 {
-  "session_order": ["session_1", "session_2", "session_3"],
+  "session_order": ["session_1", "session_2", "session_3", "session_4", "session_5"],
   "projects": {
     "alpha": {
       "agents_file": "memory_bench_projects/alpha/AGENTS.md",
       "memories": [
         {"state":"AUTHORITATIVE","summary":"In project alpha, the billing API staging deployment is in eu-west-1."},
-        {"state":"AUTHORITATIVE","summary":"In project alpha, the billing service retries failed requests up to 2 times."}
+        {"state":"AUTHORITATIVE","summary":"In project alpha, the billing service retries failed requests up to 2 times."},
+        {"state":"AUTHORITATIVE","summary":"In project alpha, the billing API migration is paused before DNS cutover; next action is verify the DNS TTL."}
       ],
       "updates_after": {
         "session_1": [
           {
             "target_summary":"In project alpha, the billing service retries failed requests up to 2 times.",
             "summary":"In project alpha, the billing service retries failed requests up to 4 times."
+          },
+          {
+            "target_summary":"In project alpha, the billing API migration is paused before DNS cutover; next action is verify the DNS TTL.",
+            "summary":"In project alpha, the DNS TTL is verified for the billing API migration; next action is deploy a 10% canary."
           }
         ],
         "session_2": [
           {
             "target_summary":"In project alpha, the billing service retries failed requests up to 4 times.",
             "summary":"In project alpha, the billing service retries failed requests up to 5 times."
+          },
+          {
+            "target_summary":"In project alpha, the DNS TTL is verified for the billing API migration; next action is deploy a 10% canary.",
+            "summary":"In project alpha, the billing API 10% canary is paused because its TLS certificate expired; next action is renew the certificate before resuming."
+          }
+        ],
+        "session_3": [
+          {
+            "target_summary":"In project alpha, the billing service retries failed requests up to 5 times.",
+            "summary":"Correction: In project alpha, production retries failed requests up to 3 times; 5 retries applied only to load tests."
+          }
+        ],
+        "session_4": [
+          {
+            "target_summary":"In project alpha, the billing API 10% canary is paused because its TLS certificate expired; next action is renew the certificate before resuming.",
+            "summary":"In project alpha, the TLS certificate is renewed; resume the billing API migration by restarting its 10% canary."
           }
         ]
       }

@@ -793,10 +793,13 @@ project's fixed `AGENTS.md`, and real `/retrieve` results from the isolated
 daemon. It first asks baseline questions, then simulates learning an updated
 daemon. Session names and order come from the corpus `session_order`; scheduled
 updates are applied between sessions by marking the old memory `SUPERSEDED` and
-inserting a new `AUTHORITATIVE` value. The current replay has three sessions and
-two sequential alpha retry-limit changes (2 to 4 to 5). Alpha's `AGENTS.md`
-remains static at 2; beta is an unchanged control project. Production project
-and global memories are neither read nor modified.
+inserting a new `AUTHORITATIVE` value. The current replay has five sessions and
+six alpha updates: retry limits change 2 to 4 to 5, then a correction says 5 was
+only for load tests and production is 3; a migration progresses from DNS
+verification, to canary, to a certificate-expiry pause, then renewal and resume.
+Alpha's `AGENTS.md` remains static at its initial guidance; beta is an unchanged
+control project. Production project and global memories are neither read nor
+modified.
 
 The corpus is deterministic retrieval test data inserted directly as memory
 rows. The staged update exercises LEMN's persisted state transition and retrieval
@@ -832,8 +835,8 @@ below exercises that separately. Per-project AGENTS fixtures are real files unde
     --out /tmp/lemn-memory-bench --repeats 2
   ```
 
-    To focus on the two consecutive changes and beta control, pass
-    `--task-ids alpha-retry-session-1,alpha-retry-session-2,alpha-retry-session-3,beta-region-session-1,beta-region-session-2`.
+    To focus on the retry correction and migration interruption/recovery, pass
+    `--task-ids alpha-retry-session-3,alpha-retry-corrected-session-4,alpha-retry-session-5,migration-interrupted-session-3,migration-still-paused-session-4,migration-resumed-session-5`.
 5. Score `blind-results.jsonl` before opening `condition-key.jsonl`. Use each
   task ID and rubric to fill `accuracy_0_or_1`, `factuality_0_to_2`,
   `usefulness_0_to_2`, and notes in `blind-scores.csv`. Then report:
@@ -853,23 +856,26 @@ quality.
 
 ### Latest Three-Arm Run
 
-On 2026-10-03, a three-session replay ran 9 tasks once per arm against a scratch
-Postgres database and isolated daemon, with Qwen 3.8 fixed across all arms.
-Against arm-specific expectations, each condition scored **9/9**. LEMN tracked
-the alpha retry limit through 2, 4, and 5; static `AGENTS.md` remained at 2;
-the no-memory arm abstained on facts it was not given. The unrelated alpha
-region and beta control stayed correct, and the cross-project and unknown-fact
-questions were answered with appropriate abstentions. Mean prompt usage was 241
-tokens for LEMN, 196 for AGENTS, and 210 for no memory; mean response times were
-4.8s, 4.4s, and 6.9s respectively. LEMN returned context on all 9 tasks.
+On 2026-10-03, a five-session replay ran 15 tasks under two independent
+within-session shuffle seeds (90 responses total), with Qwen 3.8 fixed across
+all arms and a separate scratch database/daemon for each run. All arms scored
+**15/15 against their arm-specific rubric** in both seeds. LEMN tracked the
+retry policy through 2, 4, 5, and the correction to 3 production retries; it
+also retained the migration's next action through canary pause, certificate
+renewal, and resume. LEMN scored 2.00/2 mean factuality against current state,
+versus 1.07 for static `AGENTS.md` (which intentionally retains stale guidance)
+and 1.20 for no-memory (which mostly abstained). Mean prompt usage was 291
+tokens for LEMN, 272 for AGENTS, and 231 for no memory; mean response times were
+6.3s, 6.7s, and 7.5s respectively. LEMN returned context on all 15 tasks.
 
-This is one pass over synthetic facts, and both updates were applied by the
-fixture rather than learned from conversations. It tests sequential retrieval,
-supersession, and scope isolation, not the extractor's ability to discover and
-save updates. The no-memory arm is expected to abstain on every supplied fact,
-so 9/9 means it followed that arm's rubric, not that it knew the answers.
-Results are diagnostic, not evidence of statistical superiority; repeated and
-more varied chronological traces are still needed.
+Arm-rubric accuracy is conditional: AGENTS is judged against its static file,
+and no-memory receives credit for abstaining rather than inventing facts. The
+factuality score is the indicator of whether answers matched the latest replay
+state. This remains one small synthetic scenario repeated under two task-order
+seeds, not a real-work benchmark or evidence of statistical superiority. All
+updates, including the correction and interruption/recovery, were applied by the
+fixture; this does not test conversational extraction, real tool evidence, or
+whether the system should infer that work has been interrupted.
 
 ### Write-path evaluation
 
