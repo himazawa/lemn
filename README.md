@@ -60,18 +60,21 @@ one for chat, one for writing memory, one for reading it.
                      │  FAST      HEAVY
                      │   └────┬────┘
                      ▼        ▼
-            rewrites only the "model" field; every other field
-            the client sent is forwarded untouched
+            if configured, rewrites only the "model" field;
+            every other client field is forwarded untouched
                               │
                               ▼
                         model server
                               │
                               ▼
-   answer + X-Lemn-Route / X-Lemn-Model / X-Lemn-Probability
+  answer + X-Lemn-Route (model/probability headers when available)
                               │
                               ▼
                     Pi ──▶ you   (extension shows the route in the footer)
 ```
+
+Requests whose estimated prompt size exceeds `LEMN_LONG_CONTEXT_TOKENS` go
+directly to the heavy model without classification.
 
 If Laya is unreachable or slow, the router **fails open to the heavy model**.
 Misrouting a hard question to the fast model costs answer quality; misrouting an
@@ -112,9 +115,9 @@ ends the turn with no error, which is indistinguishable from a hang.
                         │
    ┌───────────────────┼─────────────────────┬───────────────────────────┐
    ▼                   ▼                     ▼                           ▼
- no relevant        relevant tool       explicit correction       relation proposal
- tool evidence      evidence, no        or extraction relation    needs review
-                    graph impact          │                           │
+ non-correction     non-correction      correction/relation       valid-target relation proposal
+ independent claim  independent claim   not auto-confirmable      with evidence and confidence
+ without evidence   with tool evidence   (needs review)             at/above auto-confirm bar
    │                   │                  │                           │
  OBSERVED         AUTHORITATIVE     PENDING_CONFIRMATION ◀────────────┘
  (auto-promoted   (auto-promoted,      │
@@ -131,19 +134,20 @@ ends the turn with no error, which is indistinguishable from a hang.
 "Evidence" means the turn carried a tool call whose diff embeds close to the
 claim — that is, the code actually changed in the way the memory says it did.
 
-One branch of the diagram resolves itself without a human. A relation
+One branch of the diagram resolves itself without a human. A valid relation
 proposal (`supersedes`/`contradicts`) that is backed by relevant tool
 evidence **and** whose extraction confidence clears
 `LEMN_AUTO_SUPERSEDE_THRESHOLD` (default 0.95) is confirmed automatically in
 the same background job, through the same `ConfirmPendingMemory`
 transaction `lemn confirm` uses — target flipped, edge written, dependents
 cascaded to `NEEDS_REVALIDATION`. The row is stamped `auto_supersede: true`
-in provenance so unattended graph mutations are auditable. Anything that
-misses a condition — no evidence, confidence below the bar, no valid target,
-or a concurrent change that invalidates the target — stays in
-`PENDING_CONFIRMATION` for human review. The failure direction matches the
-router's philosophy: when in doubt, over-review rather than auto-destroy an
-authoritative memory.
+in provenance so unattended graph mutations are auditable. A valid relation
+that misses the evidence or confidence bar, or whose target changes before
+confirmation, stays in `PENDING_CONFIRMATION` for human review. A relation
+proposal with no valid target is downgraded to an independent claim and follows
+the normal promotion rules. The failure direction matches the router's
+philosophy: when in doubt, over-review rather than auto-destroy an authoritative
+memory.
 
 Nothing on this path blocks your conversation: `/log` returns once the turn is
 queued, and every later failure surfaces only in `docker compose logs daemon`.
@@ -217,18 +221,20 @@ curl -s -X POST localhost:8080/retrieve -H "Authorization: Bearer $LEMN_SHARED_S
 ### Memory lifecycle
 
 ```
-  extracted claim without relevant tool evidence ──▶ OBSERVED
+  non-correction independent claim without relevant tool evidence ──▶ OBSERVED
     (auto-promoted if confidence ≥ LEMN_PROMOTE_THRESHOLD,
      else inert until review)
-  evidence-backed claim that touches no other memory ──▶ AUTHORITATIVE (auto)
-  relation proposal with tool evidence AND confidence
+  evidence-backed, non-correction independent claim ──▶ AUTHORITATIVE (auto)
+  valid-target relation proposal with tool evidence AND confidence
   ≥ LEMN_AUTO_SUPERSEDE_THRESHOLD ──▶ auto-confirmed in the same job:
     AUTHORITATIVE + target SUPERSEDED/CONTRADICTED (stamped auto_supersede)
-  explicit correction or relation proposal       ──▶ PENDING_CONFIRMATION
-    (never auto-promoted, regardless of confidence)
+  explicit correction without an auto-confirmable relation ──▶ PENDING_CONFIRMATION
+  valid-target relation below auto-confirm gate ──▶ PENDING_CONFIRMATION
+  relation proposal with invalid target ──▶ downgraded to independent; normal rules apply
 
-  destructive relations (supersedes / contradicts / corrections)
-  require human confirmation; auto-promotion and depends_on do not
+  corrections and destructive relations stay pending unless a valid destructive
+  relation passes the auto-confirm gate above; dependency edges alone do not
+  require review
   ────────────────────────────────────────────────
     OBSERVED / PENDING_CONFIRMATION / legacy CANDIDATE
       ├── lemn confirm ──▶ AUTHORITATIVE
