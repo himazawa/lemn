@@ -423,15 +423,12 @@ Memory scope for this claim: %s`,
 	if err != nil {
 		return lemn.ModelExtraction{}, fmt.Errorf("dependency resolution failed: %w", err)
 	}
-	if equivalent {
-		return rejectedByExtractor(probability, globalProbability, payload.Confidence, globallyApplicable, explicitGlobal, "repeated_existing_fact"), nil
-	}
 
 	relation := "independent"
 	targetID := 0
 	relationCandidates := make([]lemn.MatchTarget, 0)
 	var summaryEmbedding []float32
-	if pgDB != nil {
+	if pgDB != nil && !equivalent {
 		searchCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		relationCandidates, summaryEmbedding, err = lemn.FindSimilarAuthoritative(searchCtx, pgDB, payload.Summary, scope)
 		cancel()
@@ -441,7 +438,7 @@ Memory scope for this claim: %s`,
 		if relationCandidates == nil {
 			relationCandidates = make([]lemn.MatchTarget, 0)
 		}
-		if len(relationCandidates) > 0 {
+		if len(relationCandidates) > 0 && !equivalent {
 			relation, targetID, err = classifyRelation(t, payload.Summary, relationCandidates)
 			if err != nil {
 				return lemn.ModelExtraction{}, fmt.Errorf("relation classification failed for turn %s: %w", t.ID, err)
@@ -450,6 +447,7 @@ Memory scope for this claim: %s`,
 	}
 	return lemn.ModelExtraction{
 		MemoryWorthy:           true,
+		ModelEquivalent:        equivalent,
 		GatePassed:             true,
 		GlobalScoped:           globallyApplicable,
 		GlobalScopeExplicit:    explicitGlobal,

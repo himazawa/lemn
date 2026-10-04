@@ -38,7 +38,10 @@ func main() {
 	cmd := os.Args[1]
 	switch cmd {
 	case "pending":
-		listPending(db)
+		if err := listPending(db); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	case "confirm":
 		if len(os.Args) < 3 {
 			fmt.Println("Usage: lemn confirm <memory_id> [memory_id...]")
@@ -101,48 +104,169 @@ func sweepPending(db *sql.DB, apply bool) {
 	}
 }
 
-func listPending(db *sql.DB) {
+func listPending(db *sql.DB) error {
 	rows, err := db.Query(`
-		SELECT id, state, project_id, category, summary, confidence, provenance 
-		FROM lemn_memories 
-		WHERE state IN ('OBSERVED', 'CANDIDATE', 'PENDING', 'PENDING_CONFIRMATION', 'NEEDS_REVALIDATION')
-		ORDER BY created_at DESC;`)
+		SELECT memory.id, memory.state, memory.project_id, memory.category,
+		       memory.summary, memory.confidence, memory.provenance, memory.created_at,
+		       COALESCE((
+		         SELECT jsonb_agg(jsonb_build_object(
+		           'id', refs.id, 'source', refs.source,
+		           'state', dependency.state, 'project_id', dependency.project_id)
+		           ORDER BY refs.source, refs.id::text)
+		         FROM (
+		           SELECT to_jsonb(edge.target_id) AS id, 'edge' AS source
+		           FROM lemn_edges edge
+		           WHERE edge.source_id = memory.id AND edge.relationship = 'depends_on'
+		           UNION ALL
+		           SELECT proposed.value AS id, 'provenance' AS source
+		           FROM jsonb_array_elements(CASE
+		             WHEN jsonb_typeof(memory.provenance->'depends_on') = 'array'
+		               THEN memory.provenance->'depends_on'
+		             WHEN memory.provenance->'depends_on' IS NULL
+		               OR memory.provenance->'depends_on' = 'null'::jsonb THEN '[]'::jsonb
+		             ELSE jsonb_build_array(memory.provenance->'depends_on')
+		           END) AS proposed(value)
+		         ) refs
+		         LEFT JOIN lemn_memories dependency ON dependency.id::text = refs.id #>> '{}'
+		       ), '[]'::jsonb)
+		FROM lemn_memories memory
+		WHERE memory.state IN ('OBSERVED', 'CANDIDATE', 'PENDING', 'PENDING_CONFIRMATION', 'NEEDS_REVALIDATION')
+		ORDER BY memory.created_at DESC;`)
 	if err != nil {
-		log.Fatalf("Failed to query pending memories: %v", err)
+		return fmt.Errorf("failed to query pending memories: %w", err)
 	}
 	defer rows.Close()
 
 	fmt.Println("\n--- PENDING MEMORIES FOR HUMAN REVIEW ---")
 	count := 0
+	now := time.Now()
 	for rows.Next() {
 		var id int
 		var state, projectID, category, summary string
 		var confidence float64
-		var provenanceJSON []byte
+		var provenanceJSON, dependenciesJSON []byte
+		var createdAt time.Time
 
-		rows.Scan(&id, &state, &projectID, &category, &summary, &confidence, &provenanceJSON)
+		if err := rows.Scan(&id, &state, &projectID, &category, &summary, &confidence, &provenanceJSON, &createdAt, &dependenciesJSON); err != nil {
+			return fmt.Errorf("failed to scan pending memory: %w", err)
+		}
+		var prov map[string]interface{}
+		if err := json.Unmarshal(provenanceJSON, &prov); err != nil {
+			return fmt.Errorf("failed to parse provenance for #%d: %w", id, err)
+		}
+		targetID := 0
+		if relation, _ := prov["proposed_relation"].(string); relation == "supersedes" || relation == "contradicts" {
+			if rawTarget, ok := prov["proposed_target_id"]; ok {
+				encoded, err := json.Marshal(rawTarget)
+				if err != nil {
+					return fmt.Errorf("failed to encode relation target for #%d: %w", id, err)
+				}
+				targetID, _ = reviewDependencyID(encoded)
+			}
+		}
+		dependencies, err := formatReviewDependencies(dependenciesJSON, id, targetID, projectID)
+		if err != nil {
+			return fmt.Errorf("failed to parse dependencies for #%d: %w", id, err)
+		}
 		count++
 
 		fmt.Printf("\n[#%d] State: %s | Project: %s | Category: %s | Confidence: %.2f\n", id, state, projectID, category, confidence)
+		fmt.Printf("      Created: %s | Age: %s\n", createdAt.Format(time.RFC3339), reviewAge(createdAt, now))
 		fmt.Printf("      Summary: %s\n", summary)
-		if len(provenanceJSON) > 0 {
-			var prov map[string]interface{}
-			json.Unmarshal(provenanceJSON, &prov)
-			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "duplicate_candidate_ids", "review_reason", "review_actor", "reviewed_at", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "invalidated_at", "revalidation_history"} {
+		if len(prov) > 0 {
+			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "duplicate_candidate_ids", "model_equivalent", "duplicate_review_required", "review_reason", "review_actor", "reviewed_at", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "invalidated_at", "revalidation_history"} {
 				if value, ok := prov[key]; ok {
-					encoded, _ := json.Marshal(value)
+					encoded, err := json.Marshal(value)
+					if err != nil {
+						return fmt.Errorf("failed to encode %s for #%d: %w", key, id, err)
+					}
 					fmt.Printf("      %s: %s\n", key, encoded)
 				}
 			}
 		}
+		for _, dependency := range dependencies {
+			fmt.Printf("      %s\n", dependency)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("Failed while iterating pending memories: %v", err)
+		return fmt.Errorf("failed while iterating pending memories: %w", err)
 	}
 
 	if count == 0 {
 		fmt.Println("No pending memories requiring review.")
 	}
+	return nil
+}
+
+func reviewAge(createdAt, now time.Time) string {
+	age := now.Sub(createdAt)
+	if age < 0 {
+		age = 0
+	}
+	label := fmt.Sprintf("%dd %dh", int(age.Hours())/24, int(age.Hours())%24)
+	if age > 7*24*time.Hour {
+		label += " | NEEDS ATTENTION (>7 days)"
+	}
+	return label
+}
+
+func reviewDependencyID(raw json.RawMessage) (int, error) {
+	text := string(raw)
+	if strings.HasPrefix(text, `"`) {
+		if err := json.Unmarshal(raw, &text); err != nil {
+			return 0, err
+		}
+	}
+	id, err := strconv.Atoi(text)
+	if err != nil {
+		return 0, err
+	}
+	if id <= 0 {
+		return 0, fmt.Errorf("dependency ID must be positive")
+	}
+	return id, nil
+}
+
+func formatReviewDependencies(raw []byte, memoryID, targetID int, projectID string) ([]string, error) {
+	var dependencies []struct {
+		ID        json.RawMessage `json:"id"`
+		Source    string          `json:"source"`
+		State     *string         `json:"state"`
+		ProjectID *string         `json:"project_id"`
+	}
+	if err := json.Unmarshal(raw, &dependencies); err != nil {
+		return nil, err
+	}
+	var lines []string
+	for _, dependency := range dependencies {
+		id, err := reviewDependencyID(dependency.ID)
+		var reasons []string
+		if err != nil {
+			reasons = append(reasons, "invalid dependency ID")
+		} else if id == memoryID || id == targetID {
+			reasons = append(reasons, "invalid dependency ID (self or relation target)")
+		}
+		state, scope := "missing", "missing"
+		if dependency.State == nil || dependency.ProjectID == nil {
+			if err == nil {
+				reasons = append(reasons, "dependency ID not found")
+			}
+		} else {
+			state, scope = *dependency.State, *dependency.ProjectID
+			if state != "AUTHORITATIVE" {
+				reasons = append(reasons, "invalid state: "+state)
+			}
+			if scope != projectID && !(projectID != "global" && scope == "global") {
+				reasons = append(reasons, "invalid scope: "+scope)
+			}
+		}
+		label := fmt.Sprintf("depends_on (%s): %s | State: %s | Project: %s", dependency.Source, dependency.ID, state, scope)
+		if len(reasons) > 0 {
+			label += " | BLOCKED: " + strings.Join(reasons, "; ")
+		}
+		lines = append(lines, label)
+	}
+	return lines, nil
 }
 
 func confirmMemories(db *sql.DB, args []string) {

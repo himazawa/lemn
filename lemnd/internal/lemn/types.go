@@ -24,6 +24,7 @@ type ModelExtraction struct {
 	GateProbability        float64       `json:"gate_probability"`   // Laya's memory-worthiness probability
 	GlobalProbability      float64       `json:"global_probability"` // Laya's user-preference probability
 	ExtractorVetoReason    string        `json:"extractor_veto_reason,omitempty"`
+	ModelEquivalent        bool          `json:"model_equivalent,omitempty"`
 	Relation               string        `json:"relation"` // "independent", "supersedes", or "contradicts"
 	TargetID               int           `json:"target_id"`
 	DependsOn              []int         `json:"depends_on"`

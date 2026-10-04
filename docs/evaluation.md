@@ -123,7 +123,14 @@ On 2026-10-04, six new acknowledgment/confirmation cases ran twice each in
 isolated scratch databases. All four explicit durable confirmations were
 retained as `OBSERVED` for human review; all six conversation acknowledgments
 and memory-ID administration turns created no memories. Two restatements of
-an existing PostgreSQL decision were vetoed as `repeated_existing_fact`.
+an existing PostgreSQL decision were vetoed as `repeated_existing_fact` in that
+run. That historical policy has since been replaced by recoverable pending
+review when the resolver suspects equivalence; the original result is not a
+measurement of the new review policy.
+Two subsequent isolated live trials under the new policy retained the repeated
+PostgreSQL claim as `PENDING_CONFIRMATION`, with `model_equivalent=true` and
+`duplicate_review_required=true`. Neither was discarded or made authoritative.
+This tests recoverability for that example, not equivalence classifier accuracy.
 Final extraction precision/recall on these 12 labeled turns was 1.00; gate
 precision was 0.60 and recall 1.00. Gate and final decisions were consistent
 across repeats. These are narrow synthetic regressions, not general accuracy

@@ -54,8 +54,9 @@ Pi -> daemon -> SQLite queue -> Laya gates -> extraction -> embedding
 extraction. A separate decision selects `global` or the turn's project scope.
 Extraction first reads only the new turn, never the existing memory list. A
 separate dependency resolver then reads the immutable claim and authoritative
-project/global candidates; it cannot rewrite the claim. Repeated existing facts
-are vetoed rather than counted as independent evidence. Explicit confirmations
+project/global candidates; it cannot rewrite the claim. Model-suspected repeated
+facts remain pending review candidates, not discarded or counted as independent
+evidence. Explicit confirmations
 of new durable decisions are distinct from conversational acknowledgments or
 memory-ID administration. Failed dependency or relation decisions fail closed.
 The extractor can reject a turn or propose relations and dependencies. Tool
@@ -127,6 +128,8 @@ invalid relation target is downgraded to an independent claim. Ordinary
 confirmation cannot restore a `NEEDS_REVALIDATION` memory.
 
 Successful confirmations record a human/automatic review actor and timestamp.
+Confirmation and rejection retry the entire transaction up to three times only
+for serialization conflicts and deadlocks; validation failures do not retry.
 Authoritative memories can be explicitly retracted with `reject --reason`;
 retraction is transactional, records its reason, and recursively quarantines
 authoritative dependents, including project memories depending on global ones.

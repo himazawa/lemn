@@ -241,7 +241,7 @@ func TestDependencyResolutionInExtraction(t *testing.T) {
 		statusCode int
 		wantError  bool
 	}{
-		{name: "repeated fact veto", response: `{"depends_on":[],"equivalent":true}`, statusCode: http.StatusOK},
+		{name: "repeated fact retained for review", response: `{"depends_on":[],"equivalent":true}`, statusCode: http.StatusOK},
 		{name: "unknown ID fails closed", response: `{"depends_on":[99],"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
 		{name: "zero ID fails closed", response: `{"depends_on":[0],"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
 		{name: "string IDs fail closed", response: `{"depends_on":["12"],"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
@@ -279,8 +279,8 @@ func TestDependencyResolutionInExtraction(t *testing.T) {
 				}
 				return
 			}
-			if err != nil || extraction.MemoryWorthy || extraction.ExtractorVetoReason != "repeated_existing_fact" || len(extraction.DependsOn) != 0 {
-				t.Fatalf("extraction = %+v, error = %v; want repeated fact veto", extraction, err)
+			if err != nil || !extraction.MemoryWorthy || !extraction.ModelEquivalent || extraction.Summary != "The billing service uses PostgreSQL." || len(extraction.DependsOn) != 0 {
+				t.Fatalf("extraction = %+v, error = %v; want repeated fact preserved for review", extraction, err)
 			}
 		})
 	}

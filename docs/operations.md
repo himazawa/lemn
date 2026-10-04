@@ -245,6 +245,41 @@ This preserves provenance and quarantines dependent authoritative claims.
 `lemn pending` lists possible duplicates for explicit review; do not confirm a
 copy unless its entity, value, polarity, and scope genuinely differ.
 
+### Blocked review queue
+
+`lemn pending` displays creation time and age, with `NEEDS ATTENTION` for
+memories older than seven days. Future timestamps have their displayed age
+clamped to zero. Age is an escalation signal only: memories are never
+automatically deleted because they have been waiting for review.
+
+Dependency details include both stored `depends_on` edges and proposed
+dependencies in provenance. `BLOCKED` identifies invalid or missing dependency
+IDs, self or proposed relation-target dependencies, non-authoritative states,
+and invisible scopes. A project memory may depend on its own project or
+`global`; a global memory may depend only on `global`. When present,
+`model_equivalent` and `duplicate_review_required` are displayed alongside
+duplicate candidates and review provenance. These details are a review-time
+snapshot, not a guarantee that confirmation will succeed.
+
+`lemn sweep` remains fail-closed: invalid dependencies prevent promotion, and
+errors are reported with a nonzero exit status. The sweep does not repair or
+silently discard dependencies. Without `--apply` it is a dry run; applying
+earlier actions may invalidate targets used by later actions.
+
+After inspecting the claim, source, scope, and duplicate candidates, explicitly
+replace or clear incorrect dependencies, or reject the claim with a reason:
+
+```bash
+lemn confirm <id> --depends-on <valid-id>,<valid-id>
+lemn confirm <id> --clear-dependencies
+lemn reject <id> --reason "Unsupported claim or invalid dependency"
+```
+
+Clear dependencies only when the claim is genuinely independent. Memories in
+`NEEDS_REVALIDATION` still require `lemn revalidate` with evidence or explicit
+user confirmation; `confirm` does not bypass quarantine. No lifecycle or sweep
+rules are changed by the visibility labels.
+
 ## Configuration reference
 
 Override Compose defaults in `.env`. Some Go defaults differ when you run the

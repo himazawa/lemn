@@ -72,6 +72,21 @@ func TestVisibleDuplicateRequiresReviewEvenWithEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture.memory(id, "OBSERVED")
+	falseDuplicateID, err := RouteExtraction(fixture.ctx, fixture.db,
+		TurnPayload{ID: "false-equivalence", ProjectID: "alpha", UserMessage: "The API uses a different timeout."},
+		ModelExtraction{MemoryWorthy: true, Type: "architecture", Summary: "The API uses a different timeout.",
+			Confidence: 1, ModelEquivalent: true, SummaryEmbedding: embedding, Relation: "independent", RelationCandidates: []MatchTarget{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flagged := fixture.memory(falseDuplicateID, "PENDING_CONFIRMATION")
+	if flagged["model_equivalent"] != true || flagged["duplicate_review_required"] != true {
+		t.Fatalf("false equivalence lost its review metadata: %v", flagged)
+	}
+	if _, err := SweepPending(fixture.ctx, fixture.db, true); err != nil {
+		t.Fatal(err)
+	}
+	fixture.memory(falseDuplicateID, "PENDING_CONFIRMATION")
 	var encoded []byte
 	if err := fixture.db.QueryRowContext(fixture.ctx, `SELECT provenance FROM lemn_memories WHERE id = $1`, globalID).Scan(&encoded); err != nil {
 		t.Fatal(err)

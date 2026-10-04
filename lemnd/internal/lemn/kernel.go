@@ -107,6 +107,12 @@ func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) 
 // ConfirmPendingMemory promotes a reviewed memory and applies its proposed
 // relation and dependencies atomically.
 func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisions ...ConfirmationDecision) error {
+	return retryTransaction(ctx, func() error {
+		return confirmPendingMemoryOnce(ctx, db, pendingID, decisions...)
+	})
+}
+
+func confirmPendingMemoryOnce(ctx context.Context, db *sql.DB, pendingID int, decisions ...ConfirmationDecision) error {
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -305,6 +311,12 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 }
 
 func RejectMemory(ctx context.Context, db *sql.DB, id int, reason string) error {
+	return retryTransaction(ctx, func() error {
+		return rejectMemoryOnce(ctx, db, id, reason)
+	})
+}
+
+func rejectMemoryOnce(ctx context.Context, db *sql.DB, id int, reason string) error {
 	if db == nil {
 		return fmt.Errorf("database is required for rejection")
 	}

@@ -140,6 +140,13 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 	}
 
 	preAutoState := extractionState(DetectCorrectionIntent(t.UserMessage).IsExplicitOverride, relation, relevant)
+	if ext.ModelEquivalent {
+		preAutoState = "PENDING_CONFIRMATION"
+		mem.Provenance["model_equivalent"] = true
+		mem.Provenance["duplicate_review_required"] = true
+		mem.Provenance["equivalence_reference_ids"] = ext.DependencyCandidateIDs
+		mem.Provenance["review_reason"] = "model_suspected_duplicate"
+	}
 	if relation == "independent" && len(corroborating) > 0 {
 		preAutoState = "PENDING_CONFIRMATION"
 		mem.Provenance["duplicate_candidate_ids"] = corroborating
@@ -155,7 +162,7 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 		mem.State = preAutoState
 	}
 
-	autoConfirm := shouldAutoConfirm(relation, mem.Confidence, relevant, mem.Provenance)
+	autoConfirm := !ext.ModelEquivalent && shouldAutoConfirm(relation, mem.Confidence, relevant, mem.Provenance)
 	if autoConfirm {
 		stampAutoSupersede(mem)
 	}
@@ -316,6 +323,11 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 		}
 		if len(jsonIntSlice(r.prov["duplicate_candidate_ids"])) > 0 {
 			a.Action, a.Reason = "keep", "possible duplicate requires explicit review"
+			actions = append(actions, a)
+			continue
+		}
+		if r.prov["duplicate_review_required"] == true {
+			a.Action, a.Reason = "keep", "model-suspected duplicate requires explicit review"
 			actions = append(actions, a)
 			continue
 		}
