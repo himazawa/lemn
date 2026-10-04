@@ -35,6 +35,7 @@ func TestRouteExtractionAutoPromotionWritesDependencyEdges(t *testing.T) {
 	t.Setenv("LEMN_EMBEDDING_URL", server.URL)
 	t.Setenv("LEMN_EMBEDDING_MODEL", "test-embedding")
 	t.Setenv("LEMN_PROMOTE_THRESHOLD", "0.9")
+	t.Setenv("LEMN_ALLOW_CONFIDENCE_PROMOTION", "true")
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -50,7 +51,7 @@ func TestRouteExtractionAutoPromotionWritesDependencyEdges(t *testing.T) {
 		_, _ = db.ExecContext(ctx, `DELETE FROM lemn_memories WHERE project_id = $1`, projectID)
 	}()
 
-	vector := "[1," + strings.TrimSuffix(strings.Repeat("0,", 1023), ",") + "]"
+	vector := "[0,1," + strings.TrimSuffix(strings.Repeat("0,", 1022), ",") + "]"
 	var dependencyID int
 	if err := db.QueryRowContext(ctx, `
 		INSERT INTO lemn_memories (state, project_id, confidence, category, summary, rationale, embedding, provenance)
@@ -70,6 +71,11 @@ func TestRouteExtractionAutoPromotionWritesDependencyEdges(t *testing.T) {
 	}
 	for index, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			if index > 0 {
+				if _, err := db.ExecContext(ctx, `UPDATE lemn_memories SET state = 'REJECTED' WHERE project_id = $1 AND id <> $2`, projectID, dependencyID); err != nil {
+					t.Fatal(err)
+				}
+			}
 			turn := TurnPayload{
 				ID:                fmt.Sprintf("turn-%d", index),
 				ProjectID:         projectID,
@@ -123,6 +129,7 @@ func TestSweepPendingAppliesPromoteAndAutoConfirm(t *testing.T) {
 		t.Skip("set LEMN_TEST_POSTGRES_DSN to an isolated database initialized from schema.sql")
 	}
 	t.Setenv("LEMN_PROMOTE_THRESHOLD", "0.9")
+	t.Setenv("LEMN_ALLOW_CONFIDENCE_PROMOTION", "true")
 	t.Setenv("LEMN_AUTO_SUPERSEDE_THRESHOLD", "0.95")
 
 	db, err := sql.Open("postgres", dsn)
@@ -158,6 +165,10 @@ func TestSweepPendingAppliesPromoteAndAutoConfirm(t *testing.T) {
 
 	targetID := insert("AUTHORITATIVE", 1, "The API uses HTTP/1.", map[string]interface{}{})
 	promoteID := insert("CANDIDATE", 0.99, "The API timeout is 30 seconds.", map[string]interface{}{})
+	orthogonal := "[0,1," + strings.TrimSuffix(strings.Repeat("0,", 1022), ",") + "]"
+	if _, err := db.ExecContext(ctx, `UPDATE lemn_memories SET embedding = $1::vector WHERE id = $2`, orthogonal, promoteID); err != nil {
+		t.Fatal(err)
+	}
 	autoConfirmID := insert("PENDING_CONFIRMATION", 0.99, "The API now uses HTTP/2.", map[string]interface{}{
 		"proposed_relation":  "supersedes",
 		"proposed_target_id": targetID,

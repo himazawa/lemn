@@ -52,13 +52,26 @@ Pi -> daemon -> SQLite queue -> Laya gates -> extraction -> embedding
 
 `LAYA_MEMORY_THRESHOLD` decides whether a turn should be considered for
 extraction. A separate decision selects `global` or the turn's project scope.
+Extraction first reads only the new turn, never the existing memory list. A
+separate dependency resolver then reads the immutable claim and authoritative
+project/global candidates; it cannot rewrite the claim. Repeated existing facts
+are vetoed rather than counted as independent evidence. Explicit confirmations
+of new durable decisions are distinct from conversational acknowledgments or
+memory-ID administration. Failed dependency or relation decisions fail closed.
 The extractor can reject a turn or propose relations and dependencies. Tool
 evidence means a tool-call diff has a high embedding similarity to the claim.
 This is a supporting signal, not proof that the diff confirms the claim.
 
 Non-correction independent claims can be promoted automatically. Evidence-backed
-claims are promoted; unbacked `OBSERVED` claims are promoted when extraction
-confidence meets `LEMN_PROMOTE_THRESHOLD`. Explicit corrections and destructive
+claims are promoted unless a possible duplicate requires review. Unbacked
+`OBSERVED` claims require human review by default, even at confidence 1.0.
+`LEMN_ALLOW_CONFIDENCE_PROMOTION=true` explicitly enables the old confidence
+policy using `LEMN_PROMOTE_THRESHOLD`; it is not a calibration guarantee.
+Independent claims are checked against authoritative same-scope plus global
+memories at the existing 0.90 near-restatement threshold. Matches become
+`PENDING_CONFIRMATION` with candidate IDs; similarity never automatically merges
+claims or supersedes another scope. Sweep also honors this review gate.
+Explicit corrections and destructive
 relations (`supersedes` or `contradicts`) normally need review. They can be
 auto-confirmed only when the target is valid, relevant tool evidence exists,
 and confidence meets `LEMN_AUTO_SUPERSEDE_THRESHOLD`. Automatic confirmation
@@ -88,7 +101,7 @@ retrieval failed. Check daemon logs for `[Retrieval Error]`.
 New independent claim
   | no relevant tool evidence
   v
-OBSERVED -- confidence gate or human confirm --> AUTHORITATIVE
+OBSERVED -- human confirm (confidence promotion opt-in only) --> AUTHORITATIVE
   |                                               ^
   | reject or sweep rejection                    |
   v                                               |
@@ -112,6 +125,14 @@ NEEDS_REVALIDATION -- fresh evidence or user confirmation --> AUTHORITATIVE
 promoted automatically. Older rows may still be reviewed as candidates. An
 invalid relation target is downgraded to an independent claim. Ordinary
 confirmation cannot restore a `NEEDS_REVALIDATION` memory.
+
+Successful confirmations record a human/automatic review actor and timestamp.
+Authoritative memories can be explicitly retracted with `reject --reason`;
+retraction is transactional, records its reason, and recursively quarantines
+authoritative dependents, including project memories depending on global ones.
+Confirmation refuses dependencies that its own destructive relation would
+invalidate and rechecks them after cascading. Sweep does not silently drop
+stale dependencies to manufacture an independent claim.
 
 ### Graph effects of confirmation
 

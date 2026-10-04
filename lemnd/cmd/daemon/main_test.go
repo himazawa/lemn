@@ -1,10 +1,13 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 
 	"lemnd/internal/lemn"
@@ -157,34 +160,185 @@ func TestTransientInstructionVetoTakesPrecedence(t *testing.T) {
 	}
 }
 
-func TestParseDependencyIDs(t *testing.T) {
+func mockExtractionServices(t *testing.T, respond func(string) (string, int)) *[]string {
+	t.Helper()
+	prompts := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/gate" {
+			json.NewEncoder(writer).Encode(map[string]any{"memory_worthy": true, "probability": 0.9})
+			return
+		}
+		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || request.Header.Get("Authorization") != "Bearer test-backend-key" {
+			t.Errorf("unexpected extraction request: %s, headers %v", request.Method, request.Header)
+		}
+		var body struct {
+			Model    string `json:"model"`
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || len(body.Messages) != 1 || body.Model != "test-extractor" {
+			t.Errorf("invalid extraction request: %+v, error %v", body, err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		prompt := body.Messages[0].Content
+		prompts = append(prompts, prompt)
+		content, statusCode := respond(prompt)
+		writer.WriteHeader(statusCode)
+		json.NewEncoder(writer).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]string{"content": content}}},
+		})
+	}))
+	t.Cleanup(server.Close)
+	oldURL := layaMemoryURL
+	layaMemoryURL = server.URL + "/gate"
+	t.Cleanup(func() { layaMemoryURL = oldURL })
+	t.Setenv("LEMN_EXTRACTION_URL", server.URL+"/extract")
+	t.Setenv("LEMN_EXTRACTION_MODEL", "test-extractor")
+	t.Setenv("LEMN_BACKEND_API_KEY", "test-backend-key")
+	return &prompts
+}
+
+func dependencyFixture(t *testing.T) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.Exec(`CREATE TABLE lemn_memories (id INTEGER, project_id TEXT, summary TEXT, state TEXT, created_at INTEGER);
+		INSERT INTO lemn_memories VALUES (12, 'alpha', 'Existing candidate sentinel: the billing service uses PostgreSQL.', 'AUTHORITATIVE', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func TestInitialExtractionIsTurnOnlyAndVetoPrecedesCandidateLookup(t *testing.T) {
+	prompts := mockExtractionServices(t, func(prompt string) (string, int) {
+		for _, forbidden := range []string{"Existing candidate sentinel", "depends_on", "Allowed candidates", "Authoritative memories eligible"} {
+			if strings.Contains(prompt, forbidden) {
+				t.Errorf("initial prompt includes %q", forbidden)
+			}
+		}
+		return `{"type":"none","summary":"","confidence":0.95}`, http.StatusOK
+	})
+	db := dependencyFixture(t)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	extraction, err := runZeroShotExtraction(lemn.TurnPayload{ProjectID: "alpha", UserMessage: "Yes, thanks."}, db)
+	if err != nil || extraction.MemoryWorthy || extraction.ExtractorVetoReason != "none_type" || len(*prompts) != 1 {
+		t.Fatalf("extraction = %+v, error = %v, calls = %d; want veto before closed DB lookup", extraction, err, len(*prompts))
+	}
+}
+
+func TestDependencyResolutionInExtraction(t *testing.T) {
 	tests := []struct {
-		name    string
-		input   string
-		want    []int
-		wantErr bool
+		name       string
+		response   string
+		statusCode int
+		wantError  bool
 	}{
-		{name: "integer array", input: `[2,4]`, want: []int{2, 4}},
-		{name: "numeric string array", input: `["2","4"]`, want: []int{2, 4}},
-		{name: "empty string means none", input: `"none"`},
-		{name: "encoded empty array means none", input: `"[]"`},
-		{name: "single numeric string", input: `"7"`, want: []int{7}},
-		{name: "malformed optional hint", input: `"current project"`, wantErr: true},
-		{name: "non-array object", input: `{"id":2}`, wantErr: true},
+		{name: "repeated fact veto", response: `{"depends_on":[],"equivalent":true}`, statusCode: http.StatusOK},
+		{name: "unknown ID fails closed", response: `{"depends_on":[99],"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
+		{name: "zero ID fails closed", response: `{"depends_on":[0],"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
+		{name: "string IDs fail closed", response: `{"depends_on":["12"],"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
+		{name: "malformed dependencies fail closed", response: `{"depends_on":"none","equivalent":false}`, statusCode: http.StatusOK, wantError: true},
+		{name: "missing dependencies fail closed", response: `{"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
+		{name: "missing equivalence fails closed", response: `{"depends_on":[]}`, statusCode: http.StatusOK, wantError: true},
+		{name: "null dependencies fail closed", response: `{"depends_on":null,"equivalent":false}`, statusCode: http.StatusOK, wantError: true},
+		{name: "equivalence cannot depend on itself", response: `{"depends_on":[12],"equivalent":true}`, statusCode: http.StatusOK, wantError: true},
+		{name: "invalid JSON fails closed", response: `not JSON`, statusCode: http.StatusOK, wantError: true},
+		{name: "HTTP failure fails closed", statusCode: http.StatusServiceUnavailable, wantError: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := parseDependencyIDs(json.RawMessage(test.input))
-			if (err != nil) != test.wantErr {
-				t.Fatalf("parseDependencyIDs() error = %v, wantErr %v", err, test.wantErr)
-			}
-			if len(got) != len(test.want) {
-				t.Fatalf("parseDependencyIDs() = %v, want %v", got, test.want)
-			}
-			for i := range got {
-				if got[i] != test.want[i] {
-					t.Fatalf("parseDependencyIDs() = %v, want %v", got, test.want)
+			prompts := mockExtractionServices(t, func(prompt string) (string, int) {
+				if strings.HasPrefix(prompt, "Analyze this") {
+					if strings.Contains(prompt, "Existing candidate sentinel") || strings.Contains(prompt, "depends_on") {
+						t.Error("initial extractor saw candidate data or dependency schema")
+					}
+					return `{"type":"decision","summary":"The billing service uses PostgreSQL.","confidence":0.95,"depends_on":[99]}`, http.StatusOK
 				}
+				for _, required := range []string{"immutable claim", "Existing candidate sentinel", "Do not copy", "mutate/rewrite", "Equivalence is not a dependency"} {
+					if !strings.Contains(prompt, required) {
+						t.Errorf("resolver prompt missing %q", required)
+					}
+				}
+				return test.response, test.statusCode
+			})
+			extraction, err := runZeroShotExtraction(lemn.TurnPayload{ProjectID: "alpha", UserMessage: "The billing service uses PostgreSQL."}, dependencyFixture(t))
+			if len(*prompts) != 2 {
+				t.Fatalf("model calls = %d, want extraction then resolver", len(*prompts))
+			}
+			if test.wantError {
+				if err == nil || !strings.Contains(err.Error(), "dependency resolution failed") || extraction.MemoryWorthy || extraction.Relation == "independent" {
+					t.Fatalf("extraction = %+v, error = %v; want error without independent fallback", extraction, err)
+				}
+				return
+			}
+			if err != nil || extraction.MemoryWorthy || extraction.ExtractorVetoReason != "repeated_existing_fact" || len(extraction.DependsOn) != 0 {
+				t.Fatalf("extraction = %+v, error = %v; want repeated fact veto", extraction, err)
+			}
+		})
+	}
+}
+
+func TestDependencyResolverCannotRewriteClaim(t *testing.T) {
+	claim := lemn.ModelExtraction{Type: "decision", Summary: "The billing service uses PostgreSQL.", Confidence: 0.91}
+	original := claim
+	mockExtractionServices(t, func(prompt string) (string, int) {
+		if !strings.Contains(prompt, claim.Summary) || !strings.Contains(prompt, `"type":"decision"`) {
+			t.Error("resolver did not receive the original claim")
+		}
+		return `{"depends_on":[12,12],"equivalent":false,"summary":"Copied candidate text","type":"architecture","confidence":1}`, http.StatusOK
+	})
+	dependencies, equivalent, err := resolveDependencies(claim.Type, claim.Summary, []lemn.DependencyCandidate{{ID: 12, Summary: "Billing requires durable transactions."}})
+	if err != nil || equivalent || !reflect.DeepEqual(dependencies, []int{12}) || !reflect.DeepEqual(claim, original) {
+		t.Fatalf("dependencies = %v, equivalent = %t, error = %v, claim = %+v", dependencies, equivalent, err, claim)
+	}
+}
+
+func TestInitialExtractionIgnoresDependencyHints(t *testing.T) {
+	prompts := mockExtractionServices(t, func(prompt string) (string, int) {
+		return `{"type":"decision","summary":"The billing service uses PostgreSQL.","confidence":0.91,"depends_on":[99]}`, http.StatusOK
+	})
+	extraction, err := runZeroShotExtraction(lemn.TurnPayload{UserMessage: "Yes, adopt PostgreSQL going forward."}, nil)
+	if err != nil || !extraction.MemoryWorthy || extraction.Type != "decision" || extraction.Summary != "The billing service uses PostgreSQL." || extraction.Confidence != 0.91 || len(extraction.DependsOn) != 0 || len(*prompts) != 1 {
+		t.Fatalf("extraction = %+v, error = %v; initial dependency hints must not be used", extraction, err)
+	}
+}
+
+func TestAcknowledgmentsAndDurableConfirmationsWithMockedModel(t *testing.T) {
+	tests := []struct {
+		name    string
+		user    string
+		content string
+		worthy  bool
+	}{
+		{name: "acknowledgment", user: "Yes, thanks.", content: `{"type":"none","summary":"","confidence":0.95}`},
+		{name: "conversation acknowledgment", user: "Got it, that answers my question.", content: `{"type":"none","summary":"","confidence":0.95}`},
+		{name: "memory ID management", user: "Confirm memory #12.", content: `{"type":"none","summary":"","confidence":0.95}`},
+		{name: "durable confirmation", user: "Yes, adopt PostgreSQL going forward.", content: `{"type":"decision","summary":"The project adopts PostgreSQL going forward.","confidence":0.95}`, worthy: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			prompts := mockExtractionServices(t, func(prompt string) (string, int) {
+				for _, required := range []string{test.user, "Explicit durable user confirmations", "Yes, adopt PostgreSQL going forward", "Conversation acknowledgments", "Memory ID management"} {
+					if !strings.Contains(prompt, required) {
+						t.Errorf("initial prompt missing %q", required)
+					}
+				}
+				return test.content, http.StatusOK
+			})
+			extraction, err := runZeroShotExtraction(lemn.TurnPayload{UserMessage: test.user, AssistantResponse: "Understood."}, nil)
+			if err != nil || extraction.MemoryWorthy != test.worthy || !extraction.GatePassed || len(*prompts) != 1 {
+				t.Fatalf("extraction = %+v, error = %v, calls = %d", extraction, err, len(*prompts))
+			}
+			if test.worthy && (extraction.Type != "decision" || extraction.Summary != "The project adopts PostgreSQL going forward.") {
+				t.Fatalf("durable claim changed: %+v", extraction)
 			}
 		})
 	}

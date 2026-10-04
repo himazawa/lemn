@@ -231,13 +231,19 @@ individual rows if that is not intended.
 | `lemn pending` | List reviewable memories and proposed relations/dependencies |
 | `lemn confirm <id> [options]` | Confirm a memory; supports relation and dependency overrides |
 | `lemn revalidate <id> [options]` | Restore a quarantined memory with explicit user confirmation or source-backed evidence |
-| `lemn reject <id>` | Reject a reviewable memory |
+| `lemn reject <id> [--reason text]` | Reject a reviewable memory, or retract an authoritative memory with a required reason; dependent memories are quarantined transactionally |
 | `lemn labeler` | Review unlabelled turns from the SQLite queue |
 | `lemn export` | Export reviewed turns for training |
 
 Outside Docker, commands need `LEMN_POSTGRES_DSN`. There is no `unsupersede`
 command. To undo a mistaken supersession, repair the database carefully. Back
 it up and inspect the related edges before changing any state.
+
+For a bad auto-promoted memory, use `lemn reject 211 --reason "Copied an existing
+preference rather than learning a new fact"` instead of directly updating SQL.
+This preserves provenance and quarantines dependent authoritative claims.
+`lemn pending` lists possible duplicates for explicit review; do not confirm a
+copy unless its entity, value, polarity, and scope genuinely differ.
 
 ## Configuration reference
 
@@ -262,6 +268,7 @@ binaries outside Docker; those differences are noted below.
 | `LEMN_LAYA_TIMEOUT` / `LEMN_EXTRACTION_TIMEOUT` | `60s` / `120s` | daemon |
 | `LEMN_RETRIEVAL_THRESHOLD` / `LEMN_RETRIEVAL_FALLBACK_MARGIN` | `0.45` / `0.10` | daemon |
 | `LEMN_SUPERSEDE_THRESHOLD` / `LEMN_PROMOTE_THRESHOLD` | `0.82` / `0.9` | daemon |
+| `LEMN_ALLOW_CONFIDENCE_PROMOTION` | `false` (unbacked claims require review) | daemon |
 | `LEMN_AUTO_SUPERSEDE_THRESHOLD` | `0.95` | daemon |
 | `LEMN_REVALIDATION_MAX_EVIDENCE_AGE` | `720h` | daemon, CLI |
 | `LEMN_REVALIDATION_ALLOWED_HOSTS` | empty | daemon, CLI |

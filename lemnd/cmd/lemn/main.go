@@ -52,11 +52,10 @@ func main() {
 		}
 		revalidateMemory(db, os.Args[2:])
 	case "reject":
-		if len(os.Args) < 3 {
-			fmt.Println("Usage: lemn reject <memory_id> [memory_id...]")
-			return
+		if err := rejectMemories(db, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
 		}
-		rejectMemories(db, os.Args[2:])
 	case "sweep":
 		sweepPending(db, len(os.Args) > 2 && os.Args[2] == "--apply")
 	default:
@@ -69,7 +68,7 @@ func printUsage() {
 	fmt.Println("  lemn pending           - List OBSERVED, CANDIDATE, pending, and revalidation memories")
 	fmt.Println("  lemn confirm <id> [id...] [--relation independent|supersedes|contradicts] [--target id] [--depends-on id,id|--clear-dependencies]")
 	fmt.Println("  lemn revalidate [--evidence-quote passage --evidence-source https_url | --user-confirmed] [--summary revised_summary] [--depends-on id,id | --clear-dependencies] <id>")
-	fmt.Println("  lemn reject <id> [id...] - Mark reviewable memories REJECTED")
+	fmt.Println("  lemn reject <id> [id...] [--reason text] - Reject reviewable memories or retract authoritative memories (reason required)")
 	fmt.Println("  lemn sweep [--apply]   - Re-apply auto-review rules to the queue (dry run without --apply)")
 }
 
@@ -129,7 +128,7 @@ func listPending(db *sql.DB) {
 		if len(provenanceJSON) > 0 {
 			var prov map[string]interface{}
 			json.Unmarshal(provenanceJSON, &prov)
-			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "invalidated_at", "revalidation_history"} {
+			for _, key := range []string{"proposed_relation", "proposed_target_id", "depends_on", "candidate_targets", "duplicate_candidate_ids", "review_reason", "review_actor", "reviewed_at", "evidence_source", "signals", "revalidation_reason", "invalidated_by_memory_id", "invalidated_dependency_id", "invalidated_at", "revalidation_history"} {
 				if value, ok := prov[key]; ok {
 					encoded, _ := json.Marshal(value)
 					fmt.Printf("      %s: %s\n", key, encoded)
@@ -300,23 +299,58 @@ func revalidateMemory(db *sql.DB, args []string) {
 	fmt.Printf("Memory #%d revalidated as AUTHORITATIVE.\n", memoryID)
 }
 
-func rejectMemories(db *sql.DB, idStrs []string) {
-	failed := false
-	for _, idStr := range idStrs {
-		result, err := db.Exec(`UPDATE lemn_memories SET state = 'REJECTED'
-			WHERE id = $1 AND state IN ('OBSERVED', 'CANDIDATE', 'PENDING', 'PENDING_CONFIRMATION', 'NEEDS_REVALIDATION')`, idStr)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Memory #%s: failed to reject: %v\n", idStr, err)
-			failed = true
+func rejectMemories(db *sql.DB, args []string) error {
+	ids, reason, err := parseRejectArgs(args)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	failed := 0
+	for _, id := range ids {
+		if err := lemn.RejectMemory(ctx, db, id, reason); err != nil {
+			fmt.Fprintf(os.Stderr, "Memory #%d: failed to reject: %v\n", id, err)
+			failed++
 			continue
 		}
-		if n, _ := result.RowsAffected(); n == 0 {
-			fmt.Printf("Memory #%s was not found in a reviewable state.\n", idStr)
+		fmt.Printf("Memory #%d marked as REJECTED.\n", id)
+	}
+	if failed > 0 {
+		return fmt.Errorf("failed to reject %d memories", failed)
+	}
+	return nil
+}
+
+func parseRejectArgs(args []string) ([]int, string, error) {
+	var flagArgs, rawIDs []string
+	for index := 0; index < len(args); index++ {
+		arg := args[index]
+		if !strings.HasPrefix(arg, "-") {
+			rawIDs = append(rawIDs, arg)
 			continue
 		}
-		fmt.Printf("Memory #%s marked as REJECTED.\n", idStr)
+		flagArgs = append(flagArgs, arg)
+		if (arg == "--reason" || arg == "-reason") && index+1 < len(args) {
+			index++
+			flagArgs = append(flagArgs, args[index])
+		}
 	}
-	if failed {
-		os.Exit(1)
+	flags := flag.NewFlagSet("reject", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	reason := flags.String("reason", "", "admin rejection or retraction reason")
+	if err := flags.Parse(flagArgs); err != nil {
+		return nil, "", err
 	}
+	if len(rawIDs) == 0 || flags.NArg() != 0 {
+		return nil, "", fmt.Errorf("Usage: lemn reject <memory_id> [memory_id...] [--reason text]")
+	}
+	ids := make([]int, 0, len(rawIDs))
+	for _, rawID := range rawIDs {
+		id, err := strconv.Atoi(rawID)
+		if err != nil || id <= 0 {
+			return nil, "", fmt.Errorf("invalid memory id %q", rawID)
+		}
+		ids = append(ids, id)
+	}
+	return ids, strings.TrimSpace(*reason), nil
 }

@@ -15,6 +15,7 @@ type ConfirmationDecision struct {
 	TargetID            int
 	DependsOn           []int
 	ReplaceDependencies bool
+	AutoConfirmed       bool
 }
 
 type RevalidationDecision struct {
@@ -106,7 +107,7 @@ func insertMemory(ctx context.Context, db *sql.DB, mem MemoryNode) (int, error) 
 // ConfirmPendingMemory promotes a reviewed memory and applies its proposed
 // relation and dependencies atomically.
 func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisions ...ConfirmationDecision) error {
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -184,15 +185,16 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 		targetID = 0
 	}
 	prov["confirmed_relation"] = relation
-	// Dependencies are validated before the target flip on purpose: the flip's
-	// cascade demotes the target's dependents, and the confirmer may itself
-	// depend on one of them (its supersedes target's dependent). Validating
-	// after the cascade would let a confirmation fail on a dependency its own
-	// transaction just demoted, rolling back the flip it caused.
 	dependencies := jsonIntSlice(prov["depends_on"])
 	sort.Ints(dependencies)
-	if _, err := tx.ExecContext(ctx, `DELETE FROM lemn_edges WHERE source_id = $1 AND relationship = 'depends_on'`, pendingID); err != nil {
-		return fmt.Errorf("failed to replace dependency edges: %w", err)
+	if targetID > 0 {
+		var targetState, targetScope string
+		if err := tx.QueryRowContext(ctx, `SELECT state, project_id FROM lemn_memories WHERE id = $1 FOR UPDATE`, targetID).Scan(&targetState, &targetScope); err != nil {
+			return fmt.Errorf("failed to lock relation target #%d: %w", targetID, err)
+		}
+		if targetState != "AUTHORITATIVE" || targetScope != projectID {
+			return fmt.Errorf("relation target #%d is no longer authoritative in scope %q", targetID, projectID)
+		}
 	}
 	for _, dependencyID := range dependencies {
 		if dependencyID <= 0 || dependencyID == pendingID || dependencyID == targetID {
@@ -206,6 +208,27 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 		if dependencyState != "AUTHORITATIVE" || !allowedScope {
 			return fmt.Errorf("dependency #%d is not authoritative and visible in scope %q", dependencyID, projectID)
 		}
+		if targetID > 0 {
+			var affected bool
+			if err := tx.QueryRowContext(ctx, `
+				WITH RECURSIVE affected(id) AS (
+					SELECT $1::int
+					UNION
+					SELECT e.source_id FROM lemn_edges e JOIN affected a ON e.target_id = a.id
+					WHERE e.relationship = 'depends_on'
+				)
+				SELECT EXISTS (SELECT 1 FROM affected WHERE id = $2)`, targetID, dependencyID).Scan(&affected); err != nil {
+				return fmt.Errorf("failed to inspect dependency invalidation closure: %w", err)
+			}
+			if affected {
+				return fmt.Errorf("dependency #%d would be invalidated by relation target #%d", dependencyID, targetID)
+			}
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM lemn_edges WHERE source_id = $1 AND relationship = 'depends_on'`, pendingID); err != nil {
+		return fmt.Errorf("failed to replace dependency edges: %w", err)
+	}
+	for _, dependencyID := range dependencies {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO lemn_edges (source_id, target_id, relationship) VALUES ($1, $2, 'depends_on') ON CONFLICT DO NOTHING`, pendingID, dependencyID); err != nil {
 			return fmt.Errorf("failed to write dependency edge to #%d: %w", dependencyID, err)
 		}
@@ -251,6 +274,21 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 			return fmt.Errorf("failed to flag dependent memories for revalidation: %w", err)
 		}
 	}
+	for _, dependencyID := range dependencies {
+		var dependencyState string
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1 FOR UPDATE`, dependencyID).Scan(&dependencyState); err != nil {
+			return fmt.Errorf("failed to recheck dependency #%d: %w", dependencyID, err)
+		}
+		if dependencyState != "AUTHORITATIVE" {
+			return fmt.Errorf("dependency #%d is no longer authoritative after confirmation cascade", dependencyID)
+		}
+	}
+	prov["review_actor"] = "human"
+	if decision.AutoConfirmed {
+		prov["review_actor"] = "auto"
+	}
+	prov["reviewed_at"] = time.Now().UTC().Format(time.RFC3339Nano)
+	prov["auto_confirmed"] = decision.AutoConfirmed
 	updatedProvenance, err := json.Marshal(prov)
 	if err != nil {
 		return fmt.Errorf("failed to encode reviewed provenance: %w", err)
@@ -263,6 +301,65 @@ func ConfirmPendingMemory(ctx context.Context, db *sql.DB, pendingID int, decisi
 		return fmt.Errorf("failed to promote memory #%d: %w", pendingID, err)
 	}
 
+	return tx.Commit()
+}
+
+func RejectMemory(ctx context.Context, db *sql.DB, id int, reason string) error {
+	if db == nil {
+		return fmt.Errorf("database is required for rejection")
+	}
+	if id <= 0 {
+		return fmt.Errorf("invalid memory id %d", id)
+	}
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("failed to begin rejection: %w", err)
+	}
+	defer tx.Rollback()
+
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM lemn_memories WHERE id = $1 FOR UPDATE`, id).Scan(&state); err != nil {
+		return fmt.Errorf("failed to fetch memory #%d for rejection: %w", id, err)
+	}
+	reason = strings.TrimSpace(reason)
+	switch state {
+	case "AUTHORITATIVE":
+		if reason == "" {
+			return fmt.Errorf("authoritative memory #%d requires a nonempty retraction reason", id)
+		}
+	case "OBSERVED", "CANDIDATE", "PENDING", "PENDING_CONFIRMATION", "NEEDS_REVALIDATION":
+		if reason == "" {
+			reason = "Rejected during admin review"
+		}
+	default:
+		return fmt.Errorf("memory #%d cannot be rejected (state=%s)", id, state)
+	}
+	reviewedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE lemn_memories SET state = 'REJECTED',
+		    provenance = COALESCE(provenance, '{}'::jsonb) || jsonb_build_object(
+		        'rejection_reason', $2::text, 'rejected_at', $3::text,
+		        'rejected_from_state', $4::text, 'review_actor', 'human', 'reviewed_at', $3::text
+		    ) WHERE id = $1`, id, reason, reviewedAt, state); err != nil {
+		return fmt.Errorf("failed to reject memory #%d: %w", id, err)
+	}
+	if state == "AUTHORITATIVE" {
+		if _, err := tx.ExecContext(ctx, `
+			WITH RECURSIVE affected(id) AS (
+				SELECT source_id FROM lemn_edges WHERE target_id = $1 AND relationship = 'depends_on'
+				UNION
+				SELECT e.source_id FROM lemn_edges e JOIN affected a ON e.target_id = a.id
+				WHERE e.relationship = 'depends_on'
+			)
+			UPDATE lemn_memories SET state = 'NEEDS_REVALIDATION',
+			    provenance = COALESCE(provenance, '{}'::jsonb) || jsonb_build_object(
+			        'revalidation_reason', 'dependency_rejected',
+			        'invalidated_by_memory_id', $1::int, 'invalidated_dependency_id', $1::int,
+			        'invalidated_at', $2::text
+			    ) WHERE state = 'AUTHORITATIVE' AND id IN (SELECT id FROM affected)`, id, reviewedAt); err != nil {
+			return fmt.Errorf("failed to invalidate dependents of memory #%d: %w", id, err)
+		}
+	}
 	return tx.Commit()
 }
 

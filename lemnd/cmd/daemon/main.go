@@ -369,95 +369,34 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 	if globallyApplicable {
 		scope = lemn.GlobalScope
 	}
-	var dependencyCandidates []lemn.DependencyCandidate
-	if pgDB != nil {
-		candidateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		dependencyCandidates, err = lemn.ListDependencyCandidates(candidateCtx, pgDB, scope, 40)
-		if err != nil {
-			return lemn.ModelExtraction{}, fmt.Errorf("dependency candidate lookup failed: %w", err)
-		}
-	}
-	dependencyJSON, _ := json.Marshal(dependencyCandidates)
-	dependencyIDs := make([]int, len(dependencyCandidates))
-	for i, candidate := range dependencyCandidates {
-		dependencyIDs[i] = candidate.ID
-	}
 	prompt := fmt.Sprintf(`Analyze this software engineering conversation turn.
 User: %s
 Assistant: %s
 
 Respond ONLY with JSON matching this format:
 
-{"type": "decision|architecture|bug_fix|preference|none", "summary": "brief summary", "confidence": 0.0-1.0, "depends_on": []}
-
-- depends_on may contain only IDs from the dependency candidate list, and only when this new claim relies on them remaining true. Do not infer dependencies from topical similarity.
+{"type": "decision|architecture|bug_fix|preference|none", "summary": "brief summary", "confidence": 0.0-1.0}
 
 Summary rules:
+- Extract a claim from this turn only. Do not invent a fact or turn an assistant suggestion into a user decision.
 - State the durable fact itself (e.g. "The router uses a 25m idle timeout"), not what happened in the turn.
 - Use preference for a persistent user preference or interaction convention that should carry across future turns; preserve whether it is global or project-specific in the fact wording.
 - A one-answer or one-task instruction (e.g. "for this answer only, be brief") is not a durable preference; use type none.
-- Use type none when the turn only describes the conversation (what the assistant explained, outlined or answered) or confirms memory IDs, without a new fact about the project or user.
+- Explicit durable user confirmations such as "Yes, adopt PostgreSQL going forward" establish a decision and should be extracted, even when phrased as a confirmation.
+- Conversation acknowledgments such as "Yes, thanks", "Got it", or "That answers my question" do not establish a durable fact; use type none.
+- Memory ID management such as "Confirm memory #12" or "Keep those memory IDs" is not a new project fact or user preference; use type none.
+- Use type none when the turn only describes the conversation (what the assistant explained, outlined or answered), without a new fact about the project or user.
 
-Memory scope for this claim: %s
-Authoritative memories eligible as dependencies (same scope or global):
-%s`,
-		t.UserMessage, t.AssistantResponse, scope, string(dependencyJSON))
-
-	reqBody, _ := json.Marshal(map[string]any{
-		"model": getenv("LEMN_EXTRACTION_MODEL", "qwen2.5-coder"),
-		"messages": []map[string]string{
-			{"role": "user", "content": prompt},
-		},
-		"response_format": map[string]string{"type": "json_object"},
-	})
-
-	client := http.Client{Timeout: getenvDuration("LEMN_EXTRACTION_TIMEOUT", 120*time.Second)}
-	extractReq, err := http.NewRequest(http.MethodPost, getenv("LEMN_EXTRACTION_URL", "http://localhost:8000/v1/chat/completions"), bytes.NewBuffer(reqBody))
-	if err != nil {
-		return lemn.ModelExtraction{}, fmt.Errorf("failed to build extraction request: %w", err)
-	}
-	extractReq.Header.Set("Content-Type", "application/json")
-	if key := os.Getenv("LEMN_BACKEND_API_KEY"); key != "" {
-		extractReq.Header.Set("Authorization", "Bearer "+key)
-	}
-
-	resp, err := client.Do(extractReq)
-	if err != nil {
-		return lemn.ModelExtraction{}, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return lemn.ModelExtraction{}, fmt.Errorf("LLM API returned status %d", resp.StatusCode)
-	}
-
-	var result struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return lemn.ModelExtraction{}, fmt.Errorf("JSON decode error: %w", err)
-	}
-	if len(result.Choices) == 0 {
-		return lemn.ModelExtraction{}, fmt.Errorf("empty choices array from LLM")
-	}
+Memory scope for this claim: %s`,
+		t.UserMessage, t.AssistantResponse, scope)
 
 	var payload struct {
-		Type       string          `json:"type"`
-		Summary    string          `json:"summary"`
-		Confidence float64         `json:"confidence"`
-		DependsOn  json.RawMessage `json:"depends_on"`
+		Type       string  `json:"type"`
+		Summary    string  `json:"summary"`
+		Confidence float64 `json:"confidence"`
 	}
-	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), &payload); err != nil {
+	if err := requestExtractionJSON(prompt, &payload); err != nil {
 		return lemn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
-	}
-	dependsOn, err := parseDependencyIDs(payload.DependsOn)
-	if err != nil {
-		log.Printf("[Extraction] turn %s has malformed depends_on; ignoring dependency hints: %v", t.ID, err)
 	}
 
 	// Type "none" is the extraction model's own veto: Laya thought the turn
@@ -465,6 +404,27 @@ Authoritative memories eligible as dependencies (same scope or global):
 	vetoReason := extractionVetoReasonForTurn(payload.Type, payload.Summary, t.UserMessage)
 	if vetoReason != "" {
 		return rejectedByExtractor(probability, globalProbability, payload.Confidence, globallyApplicable, explicitGlobal, vetoReason), nil
+	}
+
+	var dependencyCandidates []lemn.DependencyCandidate
+	if pgDB != nil {
+		candidateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		dependencyCandidates, err = lemn.ListDependencyCandidates(candidateCtx, pgDB, scope, 40)
+		cancel()
+		if err != nil {
+			return lemn.ModelExtraction{}, fmt.Errorf("dependency candidate lookup failed: %w", err)
+		}
+	}
+	dependencyIDs := make([]int, len(dependencyCandidates))
+	for index, candidate := range dependencyCandidates {
+		dependencyIDs[index] = candidate.ID
+	}
+	dependsOn, equivalent, err := resolveDependencies(payload.Type, payload.Summary, dependencyCandidates)
+	if err != nil {
+		return lemn.ModelExtraction{}, fmt.Errorf("dependency resolution failed: %w", err)
+	}
+	if equivalent {
+		return rejectedByExtractor(probability, globalProbability, payload.Confidence, globallyApplicable, explicitGlobal, "repeated_existing_fact"), nil
 	}
 
 	relation := "independent"
@@ -484,8 +444,7 @@ Authoritative memories eligible as dependencies (same scope or global):
 		if len(relationCandidates) > 0 {
 			relation, targetID, err = classifyRelation(t, payload.Summary, relationCandidates)
 			if err != nil {
-				log.Printf("[Extraction] relation classification failed for turn %s; treating as independent: %v", t.ID, err)
-				relation, targetID = "independent", 0
+				return lemn.ModelExtraction{}, fmt.Errorf("relation classification failed for turn %s: %w", t.ID, err)
 			}
 		}
 	}
@@ -508,39 +467,104 @@ Authoritative memories eligible as dependencies (same scope or global):
 	}, nil
 }
 
-func parseDependencyIDs(raw json.RawMessage) ([]int, error) {
-	if len(raw) == 0 || string(raw) == "null" {
-		return nil, nil
+func requestExtractionJSON(prompt string, payload any) error {
+	body, err := json.Marshal(map[string]any{
+		"model":           getenv("LEMN_EXTRACTION_MODEL", "qwen2.5-coder"),
+		"messages":        []map[string]string{{"role": "user", "content": prompt}},
+		"response_format": map[string]string{"type": "json_object"},
+	})
+	if err != nil {
+		return fmt.Errorf("encode extraction request: %w", err)
+	}
+	request, err := http.NewRequest(http.MethodPost, getenv("LEMN_EXTRACTION_URL", "http://localhost:8000/v1/chat/completions"), bytes.NewBuffer(body))
+	if err != nil {
+		return fmt.Errorf("build extraction request: %w", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	if key := os.Getenv("LEMN_BACKEND_API_KEY"); key != "" {
+		request.Header.Set("Authorization", "Bearer "+key)
+	}
+	client := http.Client{Timeout: getenvDuration("LEMN_EXTRACTION_TIMEOUT", 120*time.Second)}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("extraction request failed: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return fmt.Errorf("extraction API returned status %d", response.StatusCode)
+	}
+	var result struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		return fmt.Errorf("decode extraction response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return fmt.Errorf("empty extraction choices")
+	}
+	return json.Unmarshal([]byte(result.Choices[0].Message.Content), payload)
+}
+
+func resolveDependencies(extractionType, summary string, candidates []lemn.DependencyCandidate) ([]int, bool, error) {
+	if len(candidates) == 0 {
+		return []int{}, false, nil
+	}
+	claimJSON, err := json.Marshal(map[string]string{"type": extractionType, "summary": summary})
+	if err != nil {
+		return nil, false, err
+	}
+	candidatesJSON, err := json.Marshal(candidates)
+	if err != nil {
+		return nil, false, err
+	}
+	prompt := fmt.Sprintf(`Resolve dependencies for this already extracted, immutable claim:
+%s
+
+Do not copy candidate text into the claim or mutate/rewrite its summary or type. Do not extract another claim.
+Choose only candidate IDs whose continued truth is required by the claim. Topical similarity is not a dependency.
+If the claim is equivalent to or merely repeats an existing candidate fact, set equivalent to true and depends_on to [].
+A repeated existing fact is not new independent evidence. Equivalence is not a dependency.
+Otherwise set equivalent to false, and use [] if there are no actual dependencies.
+Every dependency ID must be from the allowed candidates below. Return only dependency IDs and equivalence, never summary or type.
+
+Allowed candidates:
+%s
+
+Respond only as JSON: {"depends_on":[],"equivalent":false}`, string(claimJSON), string(candidatesJSON))
+	var result struct {
+		DependsOn  json.RawMessage `json:"depends_on"`
+		Equivalent *bool           `json:"equivalent"`
+	}
+	if err := requestExtractionJSON(prompt, &result); err != nil {
+		return nil, false, err
 	}
 	var ids []int
-	if err := json.Unmarshal(raw, &ids); err == nil {
-		return ids, nil
+	if err := json.Unmarshal(result.DependsOn, &ids); err != nil || ids == nil || result.Equivalent == nil {
+		return nil, false, fmt.Errorf("resolver must return an integer depends_on array and boolean equivalent")
 	}
-	var values []string
-	if err := json.Unmarshal(raw, &values); err == nil {
-		ids = make([]int, 0, len(values))
-		for _, value := range values {
-			id, err := strconv.Atoi(strings.TrimSpace(value))
-			if err != nil {
-				return nil, fmt.Errorf("dependency ID %q is not an integer", value)
-			}
-			ids = append(ids, id)
-		}
-		return ids, nil
+	allowed := make(map[int]bool, len(candidates))
+	for _, candidate := range candidates {
+		allowed[candidate.ID] = true
 	}
-	var value string
-	if err := json.Unmarshal(raw, &value); err == nil {
-		value = strings.TrimSpace(value)
-		if value == "" || strings.EqualFold(value, "none") || value == "[]" {
-			return nil, nil
+	seen := make(map[int]bool, len(ids))
+	dependencies := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 || !allowed[id] {
+			return nil, false, fmt.Errorf("resolver returned disallowed dependency ID %d", id)
 		}
-		id, err := strconv.Atoi(value)
-		if err == nil {
-			return []int{id}, nil
+		if !seen[id] {
+			dependencies = append(dependencies, id)
+			seen[id] = true
 		}
-		return nil, fmt.Errorf("dependency hint %q is not an integer or empty value", value)
 	}
-	return nil, fmt.Errorf("dependency hints must be an integer array")
+	if *result.Equivalent && len(dependencies) != 0 {
+		return nil, false, fmt.Errorf("equivalent claims must have empty dependencies")
+	}
+	return dependencies, *result.Equivalent, nil
 }
 
 func classifyRelation(t lemn.TurnPayload, summary string, candidates []lemn.MatchTarget) (string, int, error) {

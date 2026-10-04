@@ -119,6 +119,21 @@ Use `--case-ids id,id --repeats N` to restrict a run. Validate your environment 
 
 ### Latest write-path result
 
+On 2026-10-04, six new acknowledgment/confirmation cases ran twice each in
+isolated scratch databases. All four explicit durable confirmations were
+retained as `OBSERVED` for human review; all six conversation acknowledgments
+and memory-ID administration turns created no memories. Two restatements of
+an existing PostgreSQL decision were vetoed as `repeated_existing_fact`.
+Final extraction precision/recall on these 12 labeled turns was 1.00; gate
+precision was 0.60 and recall 1.00. Gate and final decisions were consistent
+across repeats. These are narrow synthetic regressions, not general accuracy
+estimates. Extraction acceptance is not the same as authoritative promotion.
+
+PostgreSQL regression tests additionally cover visible-scope duplicate review
+even with relevant tool evidence, authoritative retraction with transitive
+dependent quarantine, human/auto review provenance, and rollback of a
+replacement whose own relation would invalidate a required dependency.
+
 On 2026-10-03, 20 cases ran three times each (60 turns), with a separate new database and daemon per trial. The gate passed all 33 expected positives (recall 1.00) and 15 of 27 negatives (precision 0.688). Extraction saved all 33 expected positives and rejected all 27 negatives on this label set (final precision/recall 1.00); it vetoed 9 gate false positives as `none` and 6 temporary instructions as `transient_instruction`. All 33 expected scope decisions and all 27 relation labels matched; repeated gate/save/scope decisions were identical. Exact summary-text consistency was 0.917.
 
 The raw global-scope classifier scored tested durable cross-project preferences below its 0.90 cutoff. Candidate prompts did not separate the 16-turn labeled set at that cutoff; an explicit cue override recovered several specifically worded preferences. A follow-up with four such paraphrases, one project preference, two durable technical decisions, and a transient instruction passed all 24 labeled decisions across three repeats. This reflects the explicit cue override on a small synthetic set, not general classifier accuracy.

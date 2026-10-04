@@ -140,6 +140,11 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 	}
 
 	preAutoState := extractionState(DetectCorrectionIntent(t.UserMessage).IsExplicitOverride, relation, relevant)
+	if relation == "independent" && len(corroborating) > 0 {
+		preAutoState = "PENDING_CONFIRMATION"
+		mem.Provenance["duplicate_candidate_ids"] = corroborating
+		mem.Provenance["review_reason"] = "possible_duplicate"
+	}
 	mem.State = autoPromoteState(preAutoState, mem.Confidence)
 	autoPromote := mem.State == "AUTHORITATIVE"
 	if autoPromote {
@@ -160,7 +165,7 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 		return 0, err
 	}
 	if autoConfirm || autoPromote {
-		if err := ConfirmPendingMemory(ctx, db, id); err != nil {
+		if err := ConfirmPendingMemory(ctx, db, id, ConfirmationDecision{AutoConfirmed: true}); err != nil {
 			// Keep the original reviewable state; do not retry the job and insert a duplicate.
 			log.Printf("[AutoPromotion] memory #%d remains %s after confirmation failed: %v", id, preAutoState, err)
 		}
@@ -168,10 +173,7 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 	return id, nil
 }
 
-// promoteThreshold is the confidence at or above which an unbacked (OBSERVED)
-// claim is auto-promoted instead of waiting for human review. Claims that
-// mutate the graph (supersedes, contradicts, corrections) are never
-// auto-promoted, regardless of confidence.
+// promoteThreshold applies only when legacy confidence promotion is opted in.
 func promoteThreshold() float64 {
 	if v := getenv("LEMN_PROMOTE_THRESHOLD", ""); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -181,18 +183,12 @@ func promoteThreshold() float64 {
 	return 0.9
 }
 
-// autoPromoteState promotes claims that need no judgment call so the review
-// queue stays small. Evidence-backed independent claims (CANDIDATE) are always
-// promoted; unbacked claims (OBSERVED) are promoted only when the extraction
-// model's own confidence clears promoteThreshold. Everything that mutates the
-// graph (supersedes, contradicts, corrections) stays human-gated here; the
-// narrow exception is shouldAutoConfirm, which confirms an evidence-backed,
-// high-confidence relation proposal right after insert.
+// autoPromoteState keeps unbacked claims reviewable unless explicitly opted in.
 func autoPromoteState(state string, confidence float64) string {
 	if state == "CANDIDATE" {
 		return "AUTHORITATIVE"
 	}
-	if state == "OBSERVED" && confidence >= promoteThreshold() {
+	if state == "OBSERVED" && getenv("LEMN_ALLOW_CONFIDENCE_PROMOTION", "false") == "true" && confidence >= promoteThreshold() {
 		return "AUTHORITATIVE"
 	}
 	return state
@@ -231,23 +227,11 @@ func shouldAutoConfirm(relation string, confidence float64, hasEvidence bool, pr
 	return jsonInt(provenance["proposed_target_id"]) > 0
 }
 
-// stampAutoSupersede records in provenance that the auto-confirm path will be
-// attempted, and drops any dependency on the relation target — once the
-// target is flipped it is no longer authoritative, and ConfirmPendingMemory
-// rejects dependencies on non-authoritative memories.
+// stampAutoSupersede records an attempted automatic confirmation without
+// removing dependencies; invalid dependencies must fail transactional review.
 func stampAutoSupersede(mem MemoryNode) {
 	mem.Provenance["auto_supersede"] = true
 	mem.Provenance["auto_supersede_reason"] = "evidence+confidence"
-	if deps := jsonIntSlice(mem.Provenance["depends_on"]); len(deps) > 0 {
-		targetID := jsonInt(mem.Provenance["proposed_target_id"])
-		filtered := deps[:0]
-		for _, dep := range deps {
-			if dep != targetID {
-				filtered = append(filtered, dep)
-			}
-		}
-		mem.Provenance["depends_on"] = filtered
-	}
 }
 
 func approvedDependencyIDs(proposed []int, validIDs map[int]struct{}) []int {
@@ -330,6 +314,11 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 			actions = append(actions, a)
 			continue
 		}
+		if len(jsonIntSlice(r.prov["duplicate_candidate_ids"])) > 0 {
+			a.Action, a.Reason = "keep", "possible duplicate requires explicit review"
+			actions = append(actions, a)
+			continue
+		}
 		if IsMetaSummary(r.summary) {
 			a.Action, a.Reason = "reject", "narrates the conversation"
 			if apply {
@@ -341,6 +330,23 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 		}
 
 		proposed, _ := r.prov["proposed_relation"].(string)
+		if proposed == "" || proposed == "independent" {
+			var duplicate bool
+			if err := db.QueryRowContext(ctx, `
+				SELECT EXISTS (
+					SELECT 1 FROM lemn_memories candidate JOIN lemn_memories existing
+					ON existing.id <> candidate.id AND existing.state = 'AUTHORITATIVE'
+					AND (existing.project_id = candidate.project_id OR (candidate.project_id <> 'global' AND existing.project_id = 'global'))
+					WHERE candidate.id = $1 AND 1 - (existing.embedding <=> candidate.embedding) >= $2
+				)`, r.id, corroborationThreshold).Scan(&duplicate); err != nil {
+				return actions, fmt.Errorf("check duplicate candidates for #%d: %w", r.id, err)
+			}
+			if duplicate {
+				a.Action, a.Reason = "keep", "possible duplicate requires explicit review"
+				actions = append(actions, a)
+				continue
+			}
+		}
 		targetID := jsonInt(r.prov["proposed_target_id"])
 		targetValid := false
 		if targetID > 0 {
@@ -408,13 +414,14 @@ func SweepPending(ctx context.Context, db *sql.DB, apply bool) ([]SweepAction, e
 // supersedeThreshold because repeating a fact is closer than replacing it.
 const corroborationThreshold = 0.90
 
-// findCorroborating returns earlier non-rejected memories in the same scope
-// that state nearly the same claim.
+// findCorroborating flags authoritative near-restatements in visible scopes;
+// similarity is not independently corroborating evidence.
 func findCorroborating(ctx context.Context, db *sql.DB, embedding []float32, scope string) ([]int, error) {
 	embeddingJSON, _ := json.Marshal(embedding)
 	rows, err := db.QueryContext(ctx, `
 		SELECT id FROM lemn_memories
-		WHERE project_id = $2 AND state <> 'REJECTED'
+		WHERE state = 'AUTHORITATIVE'
+		  AND (project_id = $2 OR ($2 <> 'global' AND project_id = 'global'))
 		  AND 1 - (embedding <=> $1::vector) >= $3
 		ORDER BY id LIMIT 10`, string(embeddingJSON), scope, corroborationThreshold)
 	if err != nil {
@@ -465,7 +472,7 @@ func persistAndConfirmMemory(ctx context.Context, db *sql.DB, id int, state stri
 	if err := setStateAndProvenance(ctx, db, id, state, prov); err != nil {
 		return err
 	}
-	return ConfirmPendingMemory(ctx, db, id)
+	return ConfirmPendingMemory(ctx, db, id, ConfirmationDecision{AutoConfirmed: true})
 }
 
 // dependencyVisible reports whether a memory in depScope is visible from a
@@ -474,18 +481,13 @@ func dependencyVisible(depScope, scope string) bool {
 	return depScope == scope || (scope != GlobalScope && depScope == GlobalScope)
 }
 
-// filterStaleDependencies drops depends_on ids that are no longer authoritative
-// and visible in the memory's scope. A dependency flipped after the memory was
-// queued (by another confirmation's cascade, or long ago) would otherwise make
-// ConfirmPendingMemory fail; the memory was not authoritative when the
-// dependency flipped, so nothing relied on the edge. Dropped ids are recorded
-// in provenance for audit.
+// filterStaleDependencies refuses stale required dependencies without removing
+// them; explicit review must correct the claim or its dependency set.
 func filterStaleDependencies(ctx context.Context, db *sql.DB, scope string, prov map[string]interface{}) error {
 	deps := jsonIntSlice(prov["depends_on"])
 	if len(deps) == 0 {
 		return nil
 	}
-	kept := make([]int, 0, len(deps))
 	var dropped []int
 	for _, id := range deps {
 		var state, depScope string
@@ -501,15 +503,12 @@ func filterStaleDependencies(ctx context.Context, db *sql.DB, scope string, prov
 		if err != nil {
 			return fmt.Errorf("check dependency #%d: %w", id, err)
 		}
-		if state == "AUTHORITATIVE" && dependencyVisible(depScope, scope) {
-			kept = append(kept, id)
-		} else {
+		if state != "AUTHORITATIVE" || !dependencyVisible(depScope, scope) {
 			dropped = append(dropped, id)
 		}
 	}
-	prov["depends_on"] = kept
 	if len(dropped) > 0 {
-		prov["dropped_dependencies"] = dropped
+		return fmt.Errorf("required dependencies %v are no longer authoritative and visible; explicit review is required", dropped)
 	}
 	return nil
 }
