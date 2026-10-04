@@ -71,6 +71,15 @@ queue.
 - [Operations](docs/operations.md): setup, Pi integration, administration, configuration, and troubleshooting.
 - [Evaluation](docs/evaluation.md): threshold tuning, benchmark steps, results, and limitations.
 
+## AI Full Disclosure
+
+LEMN was built with strong assistance from AI coding agents. Humans led the
+ideas, testing, debugging, and final decisions behind the router, daemon, Pi
+integration, and Laya-based decision flow.
+
+If you are not comfortable using software developed with significant AI
+assistance, this project may not be for you.
+
 ## License
 
 LEMN's original source code and documentation are licensed under

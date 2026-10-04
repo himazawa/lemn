@@ -157,12 +157,51 @@ export LEMN_LAYA_URL=http://127.0.0.1:8002/classify
 export LEMN_LAYA_MEMORY_URL=http://127.0.0.1:8002/memory-worthiness
 export LEMN_EXTRACTION_URL=http://localhost:8000/v1/chat/completions
 export LEMN_EMBEDDING_URL=http://localhost:8001/v1/embeddings
+export LEMN_FAST_MODEL_URL=http://localhost:8010/v1/chat/completions
+export LEMN_HEAVY_MODEL_URL=http://localhost:8011/v1/chat/completions
+export LEMN_FAST_MODEL_NAME='<fast-model-id>'
+export LEMN_HEAVY_MODEL_NAME='<heavy-model-id>'
+export LEMN_EXTRACTION_MODEL='<extraction-model-id>'
+export LEMN_EMBEDDING_MODEL='<embedding-model-id>'
 ```
 
-Build the Go services from `lemnd/`. Install the Python requirements from
-`layarouter/` in an isolated environment, then run Laya with `USE_TF=0`. Start
-PostgreSQL, Laya, the router, and daemon with the right bind addresses and
-model names. `docker-compose.yml` shows the complete container configuration.
+Start PostgreSQL and the model endpoints first. In one terminal, build the Go
+services from the repository root:
+
+```bash
+mkdir -p lemnd/bin
+cd lemnd
+go build -o bin/daemon ./cmd/daemon
+go build -o bin/router ./cmd/router
+go build -o bin/lemn ./cmd/lemn
+go build -o bin/labeler ./cmd/labeler
+go build -o bin/export ./cmd/export
+```
+
+In another terminal, install and start Laya:
+
+```bash
+cd layarouter
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+USE_TF=0 uvicorn server:app --host 127.0.0.1 --port 8002
+```
+
+In separate terminals, start the router and daemon from `lemnd/`:
+
+```bash
+./bin/router
+```
+
+```bash
+./bin/daemon
+```
+
+Export the environment settings in each terminal before starting the Go
+services. Without `LEMN_POSTGRES_DSN`, the daemon only logs turns and does not
+write or retrieve memories. `docker-compose.yml` shows the full container
+configuration.
 
 ## Scope configuration
 

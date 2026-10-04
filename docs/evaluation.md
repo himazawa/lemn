@@ -94,6 +94,12 @@ A task subset can be selected with `--task-ids id,id`. The script prints run-spe
 
 On 2026-10-03, a five-session synthetic replay ran 15 tasks under two independent within-session shuffle seeds (90 responses), using the same Qwen 3.8 model in all arms. All arms scored 15/15 on their arm-specific rubrics in both seeds. LEMN scored mean factuality 2.00/2 against the latest replay state, versus 1.07 for static `AGENTS.md` (which retained intentionally stale guidance) and 1.20 for no-memory (which mostly abstained). Mean prompt use was 291 tokens for LEMN, 272 for AGENTS, and 231 for no-memory; mean response times were 6.3s, 6.7s, and 7.5s. LEMN returned context on all 15 tasks.
 
+The 15/15 scores use a separate rubric for each arm. The AGENTS arm is scored
+against its fixed instructions, while the no-memory arm can earn credit for
+abstaining instead of inventing facts. Those scores alone do not show which arm
+best matches the latest project state. The factuality score measures agreement
+with that state; it is the more relevant comparison for updated facts.
+
 This is one small synthetic scenario repeated under two task-order seeds, not evidence of statistical superiority. All updates were applied by the fixture; the benchmark does not test conversational extraction, real tool evidence, or whether the system should infer interrupted work.
 
 ## Write-path benchmark
