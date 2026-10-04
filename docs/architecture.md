@@ -82,25 +82,65 @@ retrieval failed. Check daemon logs for `[Retrieval Error]`.
 
 ## Lifecycle and graph safety
 
+### Review states
+
 ```text
-OBSERVED / CANDIDATE / PENDING_CONFIRMATION
-  | confirm                         | reject
-  v                                 v
-AUTHORITATIVE                     REJECTED
-  |
-  | superseded or contradicted by a confirmed memory
+New independent claim
+  | no relevant tool evidence
   v
-SUPERSEDED / CONTRADICTED
-  |
-  +-- authoritative dependents -> NEEDS_REVALIDATION
-                                      | revalidate or reject
-                                      v
-                             AUTHORITATIVE / REJECTED
+OBSERVED -- confidence gate or human confirm --> AUTHORITATIVE
+  |                                               ^
+  | reject or sweep rejection                    |
+  v                                               |
+REJECTED                                          |
+                                                  |
+Evidence-backed independent claim                 |
+  +-- promotion ------------------------------- > AUTHORITATIVE
+                                                  ^
+Correction or destructive relation               |
+  v                                               |
+PENDING_CONFIRMATION -- human confirm ------------+
+  |                       or eligible auto-confirm
+  +-- reject --> REJECTED
+
+NEEDS_REVALIDATION -- fresh evidence or user confirmation --> AUTHORITATIVE
+          |
+          +-- reject --> REJECTED
 ```
 
-Only `AUTHORITATIVE` memories are retrieved. Confirmation validates relation targets and dependencies and writes memory state and graph changes transactionally. Confirming a `supersedes` or `contradicts` relation recursively moves the target's authoritative dependents to `NEEDS_REVALIDATION`; ordinary confirmation and `sweep --apply` do not restore them.
+`CANDIDATE` is the intermediate state for evidence-backed claims and is usually
+promoted automatically. Older rows may still be reviewed as candidates. An
+invalid relation target is downgraded to an independent claim. Ordinary
+confirmation cannot restore a `NEEDS_REVALIDATION` memory.
 
-Revalidation requires explicit user confirmation or a cited passage fetched from an allowlisted HTTPS host. Fetching rejects redirects outside the allowlist, private and special-use IP addresses, non-HTTPS URLs, credentials, query-bearing URLs, unsupported content types, oversized bodies, and oversized quotes. LEMN records hashes of the fetched body and cited passage and checks evidence age. A matching quote proves only that the passage appeared at the fetched source; it does not prove that the source is correct or supports the memory. Dependencies must remain authoritative or be replaced/cleared.
+### Graph effects of confirmation
+
+```text
+Confirm memory A as superseding or contradicting memory B:
+
+  A --supersedes / contradicts edge--> B
+  A: reviewable state ----------------> AUTHORITATIVE
+  B: AUTHORITATIVE -------------------> SUPERSEDED / CONTRADICTED
+  B's authoritative dependents -------> NEEDS_REVALIDATION (recursive)
+
+  A's depends_on edges are checked and written in the same transaction.
+```
+
+Confirmation validates the target and dependencies, then commits the state
+changes and graph edges in one transaction. It checks dependencies before
+flipping the target so the confirming memory can depend on other memories that
+the same transaction will invalidate. Only `AUTHORITATIVE` memories are
+retrieved.
+
+Revalidation returns a quarantined memory to `AUTHORITATIVE` only after explicit
+user confirmation or verification of a cited passage from an allowlisted HTTPS
+host. It also checks that dependencies remain authoritative, unless they are
+replaced or cleared. Source fetching rejects redirects outside the allowlist,
+private and special-use IP addresses, non-HTTPS URLs, credentials,
+query-bearing URLs, unsupported content types, oversized bodies, and oversized
+quotes. LEMN records hashes of the fetched body and quote and checks evidence
+age. A matching quote proves only that the source contained those words. It
+does not prove the source is correct or supports the memory.
 
 ## Scope
 
