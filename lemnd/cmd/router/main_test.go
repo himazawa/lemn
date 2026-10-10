@@ -39,6 +39,23 @@ func TestStreamingBudgetReportedAfterUsage(t *testing.T) {
 	if strings.Index(output, `"length"`) > strings.Index(output, "[DONE]") {
 		t.Fatal("finish must precede DONE")
 	}
+	for _, maxTokens := range []int{8192, 32768} {
+		request := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(fmt.Sprintf(`{"messages":[],"stream":true,"max_tokens":%d}`, maxTokens)))
+		response := httptest.NewRecorder()
+		handleChatCompletions(response, request)
+		for _, event := range strings.Split(response.Body.String(), "\n\n") {
+			var data []string
+			for _, line := range strings.Split(event, "\n") {
+				if strings.HasPrefix(line, "data:") {
+					data = append(data, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+				}
+			}
+			message := strings.Join(data, "\n")
+			if message != "" && message != "[DONE]" && !json.Valid([]byte(message)) {
+				t.Fatalf("proxy produced a non-JSON SSE message: %q", message)
+			}
+		}
+	}
 }
 
 func TestMarkBudgetFinish(t *testing.T) {
@@ -55,6 +72,22 @@ func TestMarkBudgetFinish(t *testing.T) {
 		}
 		if !bytes.Contains(got, []byte(`"last"`)) {
 			t.Fatalf("lost final content: %s", got)
+		}
+	}
+}
+
+func TestBufferedFinishEventsParseSeparately(t *testing.T) {
+	for _, used := range []int{42, 8192} {
+		for _, ending := range []string{"\n", "\r\n", ""} {
+			line := []byte(`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}` + ending)
+			stream := string(terminalSSEEvent(line, used, 8192)) + "data: [DONE]\n\n"
+			events := strings.Split(stream, "\n\n")
+			if len(events) != 3 {
+				t.Fatalf("JSON and DONE must be separate SSE events: %q", stream)
+			}
+			if !json.Valid([]byte(strings.TrimPrefix(events[0], "data: "))) || events[1] != "data: [DONE]" {
+				t.Fatalf("invalid SSE event data: %q", events)
+			}
 		}
 	}
 }

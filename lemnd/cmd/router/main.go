@@ -281,7 +281,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					completionTokens = usage.Usage.CompletionTokens
 				}
 				if bytes.Equal(data, []byte("[DONE]")) && len(pendingFinish) > 0 {
-					if _, err := w.Write(markBudgetFinish(pendingFinish, completionTokens, budget.MaxTokens)); err != nil {
+					if _, err := w.Write(terminalSSEEvent(pendingFinish, completionTokens, budget.MaxTokens)); err != nil {
 						return
 					}
 					pendingFinish = nil
@@ -331,7 +331,7 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if readErr != nil {
 			if len(pendingFinish) > 0 {
-				_, _ = w.Write(markBudgetFinish(pendingFinish, completionTokens, budget.MaxTokens))
+				_, _ = w.Write(terminalSSEEvent(pendingFinish, completionTokens, budget.MaxTokens))
 				if canFlush {
 					flusher.Flush()
 				}
@@ -349,6 +349,11 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func terminalSSEEvent(line []byte, used, budget int) []byte {
+	data := bytes.TrimRight(markBudgetFinish(line, used, budget), "\r\n")
+	return append(append([]byte(nil), data...), '\n', '\n')
 }
 
 func markBudgetFinish(line []byte, used, budget int) []byte {
