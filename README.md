@@ -23,6 +23,27 @@ to fast or heavy models.
 The core services are Go; the Laya classifier is Python; the Pi integration is
 TypeScript. See [Architecture](docs/architecture.md) for the flow and lifecycle.
 
+## Subagents and memory
+
+With the [child-extension setup](docs/operations.md#subagent-memory), Pi
+subagents automatically retrieve relevant LEMN project and global memories,
+but do not submit their runs as new memory candidates. **Read-only refers to
+LEMN memory access, not project files:** children can still discover facts,
+edit code, and run tests according to their assigned tools and permissions.
+
+Children should return established facts separately from hypotheses, along
+with changed files, validation commands/results, and evidence references. The
+parent reviews and integrates those findings; its normal LEMN extension logs
+the completed parent turn. LEMN then decides what to retain and whether review
+is required. This does not automatically approve a child's findings.
+
+Child tool evidence is not automatically copied into the parent's memory log.
+The parent should inspect relevant diffs or test results itself; a summarized
+child report alone may produce an unbacked candidate that needs human review.
+This avoids overlapping or speculative child reports becoming durable memory.
+Child-only defaults can be overridden by agent-specific extension settings;
+see the setup guide and reload Pi after configuration changes.
+
 ## Prototype limits and network use
 
 “Local-first” does not mean no network traffic. On first startup, LEMN downloads
