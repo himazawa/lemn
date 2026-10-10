@@ -18,18 +18,19 @@ const RETRIEVAL_LIMIT = Math.max(1, parseInt(process.env.LEMN_RETRIEVAL_LIMIT ||
 // a scope and a plain directory still gets a stable name.
 const PROJECT_ID = resolveProjectId();
 
-function resolveProjectId(): string {
+function resolveProjectId(cwd: string = process.cwd()): string {
   if (process.env.LEMN_PROJECT_ID) return process.env.LEMN_PROJECT_ID;
   try {
     const root = execFileSync("git", ["rev-parse", "--show-toplevel"], {
       encoding: "utf8",
+      cwd,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     if (root) return basename(root);
   } catch {
     // not a git repo — fall through to the working directory name
   }
-  return basename(process.cwd()) || "global";
+  return basename(cwd) || "global";
 }
 
 function authHeaders(): Record<string, string> {
@@ -50,7 +51,8 @@ function textOf(content: unknown): string {
     .trim();
 }
 
-export default function lemnExtension(pi: ExtensionAPI) {
+export default function lemnExtension(pi: ExtensionAPI, options: { readOnly?: boolean } = {}) {
+  const readOnly = options.readOnly === true || process.env.PI_SUBAGENT_CHILD === "1" || process.env.LEMN_MEMORY_READ_ONLY === "true";
   if (!LEMN_SHARED_SECRET) {
     // Fail loud in logs rather than silently sending unauthenticated
     // requests that the daemon will reject one by one.
@@ -78,7 +80,7 @@ export default function lemnExtension(pi: ExtensionAPI) {
 
   // READ PATH: fetch memories before generation and inject them as a separate
   // message — Pi builds the prompt itself, so the user's text is not editable.
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     if (!event.prompt) return;
 
     try {
@@ -88,7 +90,7 @@ export default function lemnExtension(pi: ExtensionAPI) {
         headers: authHeaders(),
         body: JSON.stringify({
           query: event.prompt,
-          project_id: PROJECT_ID,
+          project_id: ctx?.cwd ? resolveProjectId(ctx.cwd) : PROJECT_ID,
           limit: RETRIEVAL_LIMIT
         })
       });
@@ -112,6 +114,7 @@ export default function lemnExtension(pi: ExtensionAPI) {
   // WRITE PATH: log the completed turn asynchronously. agent_end hands over the
   // whole run, so the turn is reassembled from its messages.
   pi.on("agent_end", async (event) => {
+    if (readOnly) return;
     const messages: any[] = (event.messages as any[]) ?? [];
 
     let userMessage = "";

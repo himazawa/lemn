@@ -231,6 +231,34 @@ CREATE INDEX lemn_memories_scope_idx ON lemn_memories (project_id, state);
 Existing rows become global and remain visible from every project. Re-scope
 individual rows if that is not intended.
 
+## Subagent Memory
+
+For installed `pi-subagents` versions supporting child-only extension defaults,
+add to the user Pi settings (`~/.pi/agent/settings.json`), preserving other keys:
+
+```json
+{
+  "subagents": {
+    "defaultSubagentOnlyExtensions": ["/absolute/path/to/lemn/pi-extension/read-only.ts"]
+  }
+}
+```
+
+The dedicated entry point retrieves memory but never logs child runs, including
+foreground children sharing a process with the parent. Background children
+marked `PI_SUBAGENT_CHILD=1` also disable writes when loading the normal entry
+point. `LEMN_MEMORY_READ_ONLY=true` explicitly disables writes in any session.
+The parent's normal `-e .../index.ts` continues logging. Do not install both
+entry points as ambient parent extensions. Reload Pi after changing settings.
+
+Child retrieval uses the session working directory to derive project scope;
+`LEMN_PROJECT_ID` overrides it when deliberately exported. Children need the
+same daemon URL and inherited `LEMN_SHARED_SECRET`; never put secrets in agent
+prompts. An agent-specific `subagentOnlyExtensions` policy can override these
+defaults; include the read-only entry point there as well. This does not configure
+model routing or billion-context inheritance. Hook contracts can be tested with
+`node scripts/test_pi_memory_modes.mjs` using the installed package's Jiti loader.
+
 ## Admin commands
 
 | Command | Purpose |
