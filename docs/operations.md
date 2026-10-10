@@ -77,12 +77,19 @@ checkpoint the first time the service starts.
          "api": "openai-completions",
          "apiKey": "<LEMN_SHARED_SECRET>",
          "compat": { "supportsDeveloperRole": false, "supportsReasoningEffort": false },
-         "models": [{ "id": "lemn", "name": "LEMN (routed)", "contextWindow": 98304, "maxTokens": 8192 }]
+         "models": [{ "id": "lemn", "name": "LEMN (routed)", "contextWindow": 131072, "maxTokens": 32768 }]
        }
      }
    }
    ```
 
+  This profile allows a 128k context window and up to 32k generated tokens.
+  The backend must support those limits; changing Pi does not resize the model.
+  Restart or reload Pi after changing its model profile or installed extension.
+  The router requests streamed usage and reports a token-budget stop as `length`
+  when the backend supplies completion-token counts. Without usage it cannot
+  reliably distinguish truncation from a normal stop. Memory retrieval has a
+  five-second timeout so the optional memory hook cannot wait indefinitely.
   Set `contextWindow` to the heavy model's actual context window. Set
   `LEMN_LONG_CONTEXT_TOKENS` below the fast model's context window minus
   `maxTokens`.

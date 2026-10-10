@@ -84,6 +84,7 @@ export default function lemnExtension(pi: ExtensionAPI) {
     try {
       const response = await fetch(`${DAEMON_URL}/retrieve`, {
         method: "POST",
+        signal: AbortSignal.timeout(5000),
         headers: authHeaders(),
         body: JSON.stringify({
           query: event.prompt,

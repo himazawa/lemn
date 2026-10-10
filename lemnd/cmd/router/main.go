@@ -173,6 +173,23 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	lastUserMsg := ""
+	var streamRequest struct {
+		Stream bool `json:"stream"`
+	}
+	_ = json.Unmarshal(bodyBytes, &streamRequest)
+	if streamRequest.Stream {
+		var raw map[string]json.RawMessage
+		_ = json.Unmarshal(bodyBytes, &raw)
+		var options map[string]interface{}
+		_ = json.Unmarshal(raw["stream_options"], &options)
+		if options == nil {
+			options = make(map[string]interface{})
+		}
+		options["include_usage"] = true
+		encoded, _ := json.Marshal(options)
+		raw["stream_options"] = encoded
+		bodyBytes, _ = json.Marshal(raw)
+	}
 	for i := len(req.Messages) - 1; i >= 0; i-- {
 		if req.Messages[i].Role == "user" {
 			lastUserMsg = contentText(req.Messages[i].Content)
@@ -208,7 +225,10 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := http.DefaultClient.Do(proxyReq)
 	if err != nil {
-		http.Error(w, "backend model request failed: "+context.Cause(ctx).Error(), http.StatusBadGateway)
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		http.Error(w, "backend model request failed: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
@@ -236,10 +256,52 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	sawFinishReason := false
 	sawDone := false
 	startedAt := time.Now()
+	var pendingFinish []byte
+	var budget struct {
+		MaxTokens           int `json:"max_tokens"`
+		MaxCompletionTokens int `json:"max_completion_tokens"`
+	}
+	_ = json.Unmarshal(bodyBytes, &budget)
+	if budget.MaxCompletionTokens > 0 {
+		budget.MaxTokens = budget.MaxCompletionTokens
+	}
+	completionTokens := 0
 	for {
 		line, readErr := reader.ReadBytes('\n')
 		if len(line) > 0 {
 			idle.Reset(backendIdleTimeout)
+			if isSSE {
+				var usage struct {
+					Usage struct {
+						CompletionTokens int `json:"completion_tokens"`
+					} `json:"usage"`
+				}
+				data := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data:")))
+				if json.Unmarshal(data, &usage) == nil && usage.Usage.CompletionTokens > 0 {
+					completionTokens = usage.Usage.CompletionTokens
+				}
+				if bytes.Equal(data, []byte("[DONE]")) && len(pendingFinish) > 0 {
+					if _, err := w.Write(markBudgetFinish(pendingFinish, completionTokens, budget.MaxTokens)); err != nil {
+						return
+					}
+					pendingFinish = nil
+				}
+				var terminal struct {
+					Choices []struct {
+						FinishReason string `json:"finish_reason"`
+					} `json:"choices"`
+				}
+				if json.Unmarshal(data, &terminal) == nil {
+					for _, choice := range terminal.Choices {
+						if choice.FinishReason == "stop" {
+							pendingFinish = append([]byte(nil), line...)
+							sawFinishReason = true
+							line = nil
+							break
+						}
+					}
+				}
+			}
 			if _, writeErr := w.Write(line); writeErr != nil {
 				return
 			}
@@ -268,6 +330,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if readErr != nil {
+			if len(pendingFinish) > 0 {
+				_, _ = w.Write(markBudgetFinish(pendingFinish, completionTokens, budget.MaxTokens))
+				if canFlush {
+					flusher.Flush()
+				}
+			}
 			if cause := context.Cause(ctx); cause != nil {
 				readErr = cause
 			}
@@ -281,6 +349,36 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func markBudgetFinish(line []byte, used, budget int) []byte {
+	if budget <= 0 || used < budget {
+		return line
+	}
+	data := bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(line), []byte("data:")))
+	var chunk map[string]json.RawMessage
+	if json.Unmarshal(data, &chunk) != nil {
+		return line
+	}
+	var choices []map[string]json.RawMessage
+	if json.Unmarshal(chunk["choices"], &choices) != nil {
+		return line
+	}
+	for _, choice := range choices {
+		if string(choice["finish_reason"]) == `"stop"` {
+			choice["finish_reason"] = json.RawMessage(`"length"`)
+		}
+	}
+	encoded, err := json.Marshal(choices)
+	if err != nil {
+		return line
+	}
+	chunk["choices"] = encoded
+	encoded, err = json.Marshal(chunk)
+	if err != nil {
+		return line
+	}
+	return append(append([]byte("data: "), encoded...), '\n')
 }
 
 // withModel replaces the model field while preserving every other key the
