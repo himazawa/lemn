@@ -31,6 +31,7 @@ import (
 	"strings"
 	"time"
 
+	"lemnd/internal/admission"
 	"lemnd/internal/authmw"
 )
 
@@ -104,6 +105,20 @@ var (
 )
 
 var errBackendIdle = errors.New("backend idle timeout exceeded")
+var modelAdmission = admission.New()
+
+func admittedChat(background bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		release, err := modelAdmission.Acquire(r.Context(), background)
+		if err != nil {
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "model admission unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		defer release()
+		handleChatCompletions(w, r)
+	}
+}
 
 // backend is the chosen destination. model is non-empty for servers that host
 // several models behind a single URL (oMLX), where the request body — not the
@@ -148,7 +163,8 @@ func main() {
 			"and set it as Pi's model api_key.")
 	}
 
-	http.HandleFunc("/v1/chat/completions", authmw.Require(sharedSecret, handleChatCompletions))
+	http.HandleFunc("/v1/chat/completions", authmw.Require(sharedSecret, admittedChat(false)))
+	http.HandleFunc("/internal/extraction", authmw.Require(sharedSecret, admittedChat(true)))
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -198,7 +214,12 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ~3 bytes per token over-estimates for JSON-escaped code, erring toward heavy.
-	chosen := chooseBackend(lastUserMsg, len(bodyBytes)/3)
+	var chosen backend
+	if r.URL.Path == "/internal/extraction" {
+		chosen = backend{url: getenv("LEMN_EXTRACTION_URL", fastModelURL), model: getenv("LEMN_EXTRACTION_MODEL", fastModelName), label: "background", prob: -1}
+	} else {
+		chosen = chooseBackend(lastUserMsg, len(bodyBytes)/3)
+	}
 	if chosen.model != "" {
 		rewritten, err := withModel(bodyBytes, chosen.model)
 		if err != nil {

@@ -90,6 +90,7 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 	}
 	signals := map[string]interface{}{
 		"gate_probability": ext.GateProbability,
+		"gate_fallback":    ext.GateFallback,
 		"tool_calls":       len(t.ToolCalls),
 	}
 	if evidence.Tool != "" {

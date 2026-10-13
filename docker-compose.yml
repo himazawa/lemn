@@ -57,6 +57,8 @@ services:
       LEMN_CLASSIFY_TIMEOUT: ${LEMN_CLASSIFY_TIMEOUT:-5s}
       LEMN_BACKEND_IDLE_TIMEOUT: ${LEMN_BACKEND_IDLE_TIMEOUT:-25m}
       LEMN_LONG_CONTEXT_TOKENS: ${LEMN_LONG_CONTEXT_TOKENS:-30000}
+      LEMN_EXTRACTION_URL: ${LEMN_EXTRACTION_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/chat/completions}
+      LEMN_EXTRACTION_MODEL: ${LEMN_EXTRACTION_MODEL:-qwen2.5-coder}
     depends_on:
       laya:
         condition: service_healthy
@@ -82,7 +84,8 @@ services:
       LEMN_WORKER_COUNT: ${LEMN_WORKER_COUNT:-2}
       LEMN_SQLITE_PATH: /data/lemn_data.db
       LEMN_POSTGRES_DSN: postgres://${POSTGRES_USER:-lemn}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-lemn_kernel}?sslmode=disable
-      LEMN_EXTRACTION_URL: ${LEMN_EXTRACTION_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/chat/completions}
+      LEMN_EXTRACTION_URL: http://router:8090/internal/extraction
+      LEMN_EXTRACTION_VIA_ROUTER: "true"
       LEMN_EXTRACTION_MODEL: ${LEMN_EXTRACTION_MODEL:-qwen2.5-coder}
       LEMN_EMBEDDING_URL: ${LEMN_EMBEDDING_URL:-${OMLX_URL:-http://host.docker.internal:8000}/v1/embeddings}
       LEMN_EMBEDDING_MODEL: ${LEMN_EMBEDDING_MODEL:-bge-m3}
@@ -100,6 +103,8 @@ services:
     volumes:
       - lemndata:/data
     depends_on:
+      router:
+        condition: service_healthy
       postgres:
         condition: service_healthy
       laya:

@@ -1,10 +1,14 @@
 package logstore
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"lemnd/internal/backenderr"
 	"math"
+	"math/rand"
+	"net"
 	"time"
 )
 
@@ -76,6 +80,13 @@ func MarkCompleted(db *sql.DB, jobID int64) error {
 // max_attempts is reached. FAILED jobs are left in place (not deleted)
 // for later inspection rather than silently dropped.
 func MarkFailed(db *sql.DB, job *Job, cause error) error {
+	var resource *backenderr.ResourceError
+	var network net.Error
+	if errors.As(cause, &resource) || errors.As(cause, &network) || errors.Is(cause, context.DeadlineExceeded) {
+		delay := 30 + rand.Intn(31)
+		_, err := db.Exec(`UPDATE memory_jobs SET status = 'RETRY', error = ?, locked_at = NULL, available_at = datetime(CURRENT_TIMESTAMP, ?) WHERE id = ?`, cause.Error(), fmt.Sprintf("+%d seconds", delay), job.ID)
+		return err
+	}
 	attempts := job.Attempts + 1
 
 	if attempts >= job.MaxAttempts {

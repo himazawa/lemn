@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"lemnd/internal/backenderr"
 	"math"
 	"net/http"
 	"os"
@@ -39,6 +40,12 @@ func getEmbedding(ctx context.Context, text string) ([]float32, error) {
 		return nil, fmt.Errorf("embedding request failed: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		if err := backenderr.FromStatus(resp.StatusCode); err != nil {
+			return nil, err
+		}
+		return nil, fmt.Errorf("embedding API returned status %d", resp.StatusCode)
+	}
 
 	var result struct {
 		Data []struct {
@@ -50,6 +57,14 @@ func getEmbedding(ctx context.Context, text string) ([]float32, error) {
 	}
 	if len(result.Data) == 0 {
 		return nil, fmt.Errorf("empty embedding response")
+	}
+	if len(result.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("empty embedding vector")
+	}
+	for _, value := range result.Data[0].Embedding {
+		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
+			return nil, fmt.Errorf("non-finite embedding vector")
+		}
 	}
 	return result.Data[0].Embedding, nil
 }

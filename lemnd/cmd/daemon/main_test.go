@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -160,12 +161,130 @@ func TestTransientInstructionVetoTakesPrecedence(t *testing.T) {
 	}
 }
 
-func mockExtractionServices(t *testing.T, respond func(string) (string, int)) *[]string {
+func TestTaskInstructionDoesNotVetoProjectFinding(t *testing.T) {
+	if got := extractionVetoReasonForTurn("architecture", "HP framing consumes length minus four plus varint width.", "For this task only, inspect the failing test."); got != "" {
+		t.Fatalf("project finding vetoed: %s", got)
+	}
+}
+
+func TestGateRejectionReviewIsNarrow(t *testing.T) {
+	for _, test := range []struct {
+		turn lemn.TurnPayload
+		want bool
+	}{
+		{lemn.TurnPayload{UserMessage: "sorry remember that y is 2"}, true},
+		{lemn.TurnPayload{UserMessage: "thanks", AssistantResponse: "Understood."}, false},
+		{lemn.TurnPayload{AssistantResponse: "Test passes", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "ok"}}}, true},
+		{lemn.TurnPayload{AssistantResponse: "Compressed", ToolCalls: []lemn.ToolCallEvidence{{Name: "compress", DiffText: "ok"}}}, false},
+	} {
+		if got := shouldReviewGateRejection(test.turn); got != test.want {
+			t.Fatalf("gate review = %t, want %t", got, test.want)
+		}
+	}
+	bounded := boundExtractionText("head"+strings.Repeat("x", 20000)+"tail", 100)
+	if !strings.HasPrefix(bounded, "head") || !strings.HasSuffix(bounded, "tail") || len(bounded) > 130 {
+		t.Fatal("extraction text lost boundaries or exceeded budget")
+	}
+}
+
+func TestRetrieveUnavailableReturnsServiceError(t *testing.T) {
+	response := httptest.NewRecorder()
+	handleRetrieve(nil).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/retrieve", strings.NewReader(`{"query":"y"}`)))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", response.Code)
+	}
+}
+
+func TestExtractionPromptBoundsToolEvidence(t *testing.T) {
+	turn := lemn.TurnPayload{ProjectID: "dpm", UserMessage: "Continue the investigation.", AssistantResponse: "The HP test passes."}
+	turn.ToolCalls = append(turn.ToolCalls, lemn.ToolCallEvidence{Name: "compress", DiffText: "historical-summary-sentinel"})
+	for index := 0; index < 10; index++ {
+		turn.ToolCalls = append(turn.ToolCalls, lemn.ToolCallEvidence{Name: "bash", DiffText: strings.Repeat("x", 3000)})
+	}
+	prompt := extractionPrompt(turn, "dpm")
+	if strings.Contains(prompt, "historical-summary-sentinel") || strings.Count(prompt, "[excerpt truncated]") != 4 || strings.Count(prompt, "x") > 8100 {
+		t.Fatal("tool evidence was not filtered or bounded")
+	}
+	if !strings.Contains(prompt, "The HP test passes.") || !strings.Contains(prompt, "Memory scope: dpm") {
+		t.Fatal("turn or scope missing")
+	}
+}
+
+func TestDPMExtractionInputs(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		turn    lemn.TurnPayload
+		typ     string
+		summary string
+	}{
+		{"explicit remember", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "sorry remember that the value of y is 2", AssistantResponse: "The value of y is 2. Next we will add fixtures."}, "decision", "The user declares that y is 2."},
+		{"validated HP report", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "For this task only, investigate the test.", AssistantResponse: "The HP test passes; framing consumes value - 4 + varint width. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}, "architecture", "HP framing consumes value - 4 + varint width; the missed-spawn HP test passes."},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			mockExtractionServices(t, func(prompt string) (string, int) {
+				if !strings.Contains(prompt, test.turn.UserMessage) || !strings.Contains(prompt, "user-declared project fact") || !strings.Contains(prompt, "validated project behavior") {
+					t.Error("extraction contract omits source or durable fact rules")
+				}
+				body, _ := json.Marshal(map[string]any{"type": test.typ, "summary": test.summary, "confidence": 0.9})
+				return string(body), http.StatusOK
+			})
+			got, err := runZeroShotExtraction(test.turn, nil)
+			if err != nil || !got.MemoryWorthy || got.Type != test.typ || got.Summary != test.summary || got.GlobalScoped {
+				t.Fatalf("extraction = %+v, error = %v", got, err)
+			}
+		})
+	}
+}
+
+func TestDPMExtractionLive(t *testing.T) {
+	if os.Getenv("LEMN_LIVE_EXTRACTION_TEST") != "true" {
+		t.Skip("requires an explicitly configured live extraction backend")
+	}
+	oldSecret := sharedSecret
+	sharedSecret = os.Getenv("LEMN_SHARED_SECRET")
+	t.Cleanup(func() { sharedSecret = oldSecret })
+	for _, test := range []struct {
+		name string
+		turn lemn.TurnPayload
+	}{
+		{"remember", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "sorry remember that the value of y is 2", AssistantResponse: "The value of y is 2. Next we will add fixtures."}},
+		{"HP framing", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "Continue the HP packet decoder investigation.", AssistantResponse: "The missed-spawn HP test passes. Framing consumes value - 4 + varint width: value 20 and width 1 consume 17 bytes. HP scanning runs over the whole buffer. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}},
+		{"slice limitation", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "Continue the fixture investigation.", AssistantResponse: "The v2.0.58 oracle reports NothingDerived for the slice. Boss entity 33962 has 616027 damage but no spawn-derived mob code, preventing boss recognition. This is a negative golden, not absence of damage packets.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "exit 1: a2t-oracle: derive: no damage derived from the slice"}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := runZeroShotExtraction(test.turn, nil)
+			if err != nil || !got.MemoryWorthy || got.GlobalScoped || strings.TrimSpace(got.Summary) == "" {
+				t.Fatalf("live extraction = %+v, error = %v", got, err)
+			}
+			if test.name == "remember" && (!strings.Contains(got.Summary, "y") || !strings.Contains(got.Summary, "2")) {
+				t.Fatalf("explicit declaration lost: %q", got.Summary)
+			}
+			t.Logf("%s: %s", got.Type, got.Summary)
+		})
+	}
+}
+
+func TestGateFallbackPreservesClassifierDecision(t *testing.T) {
+	for _, typ := range []string{"architecture", "none"} {
+		t.Run(typ, func(t *testing.T) {
+			mockExtractionServices(t, func(prompt string) (string, int) {
+				return `{"type":"` + typ + `","summary":"Validated framing rule.","confidence":0.9}`, http.StatusOK
+			}, false)
+			got, err := runZeroShotExtraction(lemn.TurnPayload{UserMessage: "Continue.", AssistantResponse: "Test passes.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "ok"}}}, nil)
+			if err != nil || got.GatePassed || !got.GateFallback || got.MemoryWorthy != (typ != "none") {
+				t.Fatalf("fallback = %+v, error = %v", got, err)
+			}
+		})
+	}
+}
+
+func mockExtractionServices(t *testing.T, respond func(string) (string, int), gate ...bool) *[]string {
 	t.Helper()
 	prompts := []string{}
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.URL.Path == "/gate" {
-			json.NewEncoder(writer).Encode(map[string]any{"memory_worthy": true, "probability": 0.9})
+			worthy := len(gate) == 0 || gate[0]
+			json.NewEncoder(writer).Encode(map[string]any{"memory_worthy": worthy, "probability": 0.9})
 			return
 		}
 		if request.Method != http.MethodPost || request.Header.Get("Content-Type") != "application/json" || request.Header.Get("Authorization") != "Bearer test-backend-key" {

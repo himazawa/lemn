@@ -52,6 +52,24 @@ function textOf(content: unknown): string {
 }
 
 export default function lemnExtension(pi: ExtensionAPI, options: { readOnly?: boolean } = {}) {
+  let lastJobId: number | undefined;
+  pi.registerCommand?.("lemn-job", {
+    description: "Show the last memory extraction job outcome",
+    handler: async (_args, ctx) => {
+      if (!lastJobId) { ctx.ui.notify("No acknowledged memory job in this session.", "info"); return; }
+      try {
+        const response = await fetch(`${DAEMON_URL}/jobs/${lastJobId}`, { headers: authHeaders(), signal: AbortSignal.timeout(5000) });
+        if (!response.ok) throw new Error(`job HTTP ${response.status}`);
+        const job = await response.json();
+        const outcome = job.status === "COMPLETED"
+          ? (job.extraction?.memory_worthy ? "processed; memory authority still depends on review rules" : `not retained: ${job.extraction?.extractor_veto_reason || "worthiness gate"}`)
+          : job.status === "RETRY" ? "waiting to retry backend work" : job.status;
+        ctx.ui.notify(`Memory job #${lastJobId}: ${outcome}${job.status === "FAILED" ? ` (${job.error || "processing failed"})` : ""}`, job.status === "FAILED" ? "warning" : "info");
+      } catch {
+        ctx.ui.notify("Memory job status unavailable.", "warning");
+      }
+    }
+  });
   const readOnly = options.readOnly === true || process.env.PI_SUBAGENT_CHILD === "1" || process.env.LEMN_MEMORY_READ_ONLY === "true";
   if (!LEMN_SHARED_SECRET) {
     // Fail loud in logs rather than silently sending unauthenticated
@@ -94,7 +112,7 @@ export default function lemnExtension(pi: ExtensionAPI, options: { readOnly?: bo
           limit: RETRIEVAL_LIMIT
         })
       });
-      if (!response.ok) return;
+      if (!response.ok) throw new Error(`retrieval HTTP ${response.status}`);
 
       const memories = await response.json();
       if (!Array.isArray(memories) || memories.length === 0) return;
@@ -107,13 +125,14 @@ export default function lemnExtension(pi: ExtensionAPI, options: { readOnly?: bo
         }
       };
     } catch (err) {
-      // Non-blocking fallback: proceed without memory if daemon is unreachable
+      ctx.ui?.setStatus?.("lemn-memory", "memory retrieval unavailable");
+      console.error("[lemn] Memory retrieval failed; proceeding without memories.");
     }
   });
 
   // WRITE PATH: log the completed turn asynchronously. agent_end hands over the
   // whole run, so the turn is reassembled from its messages.
-  pi.on("agent_end", async (event) => {
+  pi.on("agent_end", async (event, ctx) => {
     if (readOnly) return;
     const messages: any[] = (event.messages as any[]) ?? [];
 
@@ -148,16 +167,28 @@ export default function lemnExtension(pi: ExtensionAPI, options: { readOnly?: bo
       }
     }
 
-    fetch(`${DAEMON_URL}/log`, {
+    try {
+    const response = await fetch(`${DAEMON_URL}/log`, {
       method: "POST",
+      signal: AbortSignal.timeout(5000),
       headers: authHeaders(),
       body: JSON.stringify({
         id: `turn_${Date.now()}`,
-        project_id: PROJECT_ID,
+        project_id: ctx?.cwd ? resolveProjectId(ctx.cwd) : PROJECT_ID,
         user_message: userMessage,
         assistant_response: assistantResponse,
         tool_calls: toolCalls
       })
-    }).catch(() => {});
+    });
+    if (!response.ok) throw new Error(`log HTTP ${response.status}`);
+    if (response.json) {
+      const acknowledgment = await response.json();
+      if (Number.isInteger(acknowledgment.job_id)) lastJobId = acknowledgment.job_id;
+    }
+    ctx?.ui?.setStatus?.("lemn-memory", "memory extraction queued");
+    } catch (err) {
+      ctx?.ui?.setStatus?.("lemn-memory", "memory submission failed");
+      console.error("[lemn] Turn submission failed; memory was not acknowledged.");
+    }
   });
 }

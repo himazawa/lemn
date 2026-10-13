@@ -16,6 +16,7 @@ type TurnPayload struct {
 type ModelExtraction struct {
 	MemoryWorthy           bool          `json:"memory_worthy"`
 	GatePassed             bool          `json:"gate_passed"`
+	GateFallback           bool          `json:"gate_fallback,omitempty"`
 	GlobalScoped           bool          `json:"global_scoped"` // user-level preference rather than a project fact
 	GlobalScopeExplicit    bool          `json:"global_scope_explicit,omitempty"`
 	Type                   string        `json:"type"` // "decision", "architecture", "bug_fix", "preference", "none"
