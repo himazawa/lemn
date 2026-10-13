@@ -19,8 +19,8 @@ to fast or heavy models.
 - Stores memory state, provenance, scope, and dependencies in PostgreSQL with pgvector.
 - Retrieves authoritative memories before a turn and injects them separately.
 - Optionally routes chat requests through a fast/heavy model router.
-- Coordinates routed foreground generation and background extraction through
-	a shared admission gate, with foreground priority.
+- Coordinates routed chat, extraction, and embedding inference through a shared
+  admission gate, with foreground priority.
 - Defers resource-related background failures durably instead of exhausting
 	the content-error retry budget during an outage.
 
@@ -44,16 +44,19 @@ after updating its extension. `/retrieve` is an authenticated daemon HTTP endpoi
 not a Pi slash command.
 
 Extraction receives bounded, turn-local tool excerpts alongside user and assistant
-text. Explicit remember requests and reports with non-control tool evidence can
-receive extractor review even if the worthiness classifier rejects them. The
-extractor can still return `none`; classifier scores and fallback provenance are
-retained. Extraction preserves user declarations, validated findings and uncertainty
-without converting plans into completed work. These rules improve coverage, not
-prove factual accuracy. One turn currently produces at most one extracted summary.
+text. A direct user message beginning with `remember` is deterministically stored
+as a **user-declared** project fact; it bypasses flaky worthiness/extraction model
+calls, but is not independent verification. Duplicate or conflicting candidates
+can still send it to review. Other reports with tool evidence can receive a second
+extraction review when the worthiness classifier rejects them. Model-extracted
+reports can still return `none`; classifier scores and fallback provenance are
+retained. Plans are not treated as completed work. These rules improve coverage,
+not factual accuracy. One turn currently produces at most one extracted summary.
 
 Retrieved memories must be `AUTHORITATIVE`, scoped to the current project or
-`global`, and relevant to the query. Merely saying "remember y is 2" or receiving
-an acknowledgment does not guarantee fresh-session recall. Unbacked claims remain
+`global`, and relevant to the query. A queued explicit remember becomes available
+after processing and successful embedding/retrieval; enqueue acknowledgment alone
+does not guarantee fresh-session recall. Unbacked non-explicit claims remain
 reviewable by default; confidence-only promotion stays disabled. Duplicate suspects,
 dependencies, corrections and revalidation still follow the kernel's review rules.
 Use `lemn pending`, `lemn confirm`, `lemn reject --reason`, and `lemn revalidate`
@@ -91,28 +94,32 @@ Do not raise memory ceilings or extend timeouts blindly to hide those failures.
 See [Resource Scheduling](docs/resource-scheduling.md) for configuration, limits,
 staged deployment and recovery procedures.
 
-## Embedding isolation
+## Embedding scheduling
 
-Embeddings can run separately from generation to avoid sharing its scheduler and
-Metal caches. **A container is not required**: a dedicated native ARM64 CPU process
-may be a better fit on Apple Silicon. Both approaches still consume shared system
-RAM and need measured concurrency and latency limits.
+LEMN uses the existing native oMLX BGE-M3 embedding model. Foreground query
+embeddings and background extraction embeddings pass through the same router
+admission gate as chat generation. Foreground retrieval waits for the model slot;
+background work defers when foreground work is active or queued. This coordinates
+inference without loading a duplicate model or changing the stored vector space.
+It does not make MLX CPU-only or add memory headroom: oMLX and all LEMN requests
+still share system resources.
 
-The optional [embedding Compose override](docker-compose.embeddings.yml) stages
-TEI with CPU BGE-M3. It uses an **amd64 image emulated on Apple Silicon**, with VM
-overhead; it is not a verified performance recommendation. The separate
-[activation override](docker-compose.embeddings-active.yml) changes the daemon's
-endpoint only when explicitly included. Base Compose does not activate it.
+The current model is `bge-m3-mlx-fp16` (1024 dimensions, native XLM-RoBERTa with
+BGE-M3 CLS pooling and normalization). Keep that model and pooling configuration
+compatible with existing stored vectors. A different model requires measured
+retrieval parity and, if incompatible, an explicit re-embedding migration. Do not
+switch vector spaces based only on matching dimensions.
 
-Before switching, verify service readiness, matching vector dimensions, vector
-parity against the existing embedder, retrieval quality against stored summaries,
-and latency within the retrieval deadline. Matching 1024 dimensions alone is not
-enough. The opt-in `TestEmbeddingBackendParity` provides a four-text cosine smoke
-test, not complete compatibility certification. An incompatible model needs an
-explicit re-embedding migration; never silently mix vector spaces.
+Daemon-to-router embedding calls authenticate with `LEMN_SHARED_SECRET`; the
+router-to-oMLX request uses `LEMN_BACKEND_API_KEY`. Configure both credentials
+for their respective services and restart affected services after rotating either
+key.
 
-TEI's INFO startup log can contain its API-key argument; the staged configuration
-uses warning-level logging. Rotate any previously exposed credential.
+The earlier TEI CPU-container experiment could not download the BGE-M3 ONNX
+artifacts (repeated Hugging Face 404s) and has been removed. It was never activated.
+The existing native endpoint returned HTTP 200, and live LEMN retrieval completed
+in 0.72 seconds. That query returned unrelated global preference candidates below
+threshold, however; fresh-session recall of a DPM fact is still unverified.
 
 ## Subagents and memory
 

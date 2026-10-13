@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 
 	_ "modernc.org/sqlite"
 )
@@ -68,6 +69,9 @@ func Open() (*sql.DB, error) {
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("failed to init memory_jobs schema: %w", err)
+	}
+	if _, err := db.Exec(`ALTER TABLE memory_jobs ADD COLUMN deferrals INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return nil, fmt.Errorf("failed to migrate memory_jobs schema: %w", err)
 	}
 
 	return db, nil

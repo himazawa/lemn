@@ -67,6 +67,7 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 			"source_turn_id":        t.ID,
 			"user_message":          t.UserMessage,
 			"kernel_schema_version": 2,
+			"user_declared":         ext.UserDeclared,
 		},
 	}
 
@@ -140,7 +141,12 @@ func RouteExtraction(ctx context.Context, db *sql.DB, t TurnPayload, ext ModelEx
 		signals["target_similarity"] = targetSimilarity
 	}
 
-	preAutoState := extractionState(DetectCorrectionIntent(t.UserMessage).IsExplicitOverride, relation, relevant)
+	preAutoState := extractionStateForClaim(
+		DetectCorrectionIntent(t.UserMessage).IsExplicitOverride,
+		relation,
+		relevant,
+		ext.UserDeclared,
+	)
 	if ext.ModelEquivalent {
 		preAutoState = "PENDING_CONFIRMATION"
 		mem.Provenance["model_equivalent"] = true
@@ -266,6 +272,14 @@ func extractionState(explicitCorrection bool, relation string, hasRelevantEviden
 		return "CANDIDATE"
 	}
 	return "OBSERVED"
+}
+
+func extractionStateForClaim(explicitCorrection bool, relation string, hasRelevantEvidence, userDeclared bool) string {
+	state := extractionState(explicitCorrection, relation, hasRelevantEvidence)
+	if userDeclared && !explicitCorrection {
+		return "CANDIDATE"
+	}
+	return state
 }
 
 type SweepAction struct {

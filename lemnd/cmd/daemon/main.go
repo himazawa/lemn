@@ -83,8 +83,8 @@ func main() {
 }
 
 func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
 	return def
 }
@@ -157,7 +157,7 @@ func handleRetrieve(pgDB *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		ctx, cancel := context.WithTimeout(r.Context(), getenvDuration("LEMN_RETRIEVAL_TIMEOUT", 10*time.Second))
 		defer cancel()
 
 		memories, err := lemn.QueryAuthoritativeMemories(ctx, pgDB, req.Query, req.ProjectID, req.Limit)
@@ -230,9 +230,7 @@ func readAll(r *http.Request) ([]byte, error) {
 }
 
 // runWorker is the background loop that turns durable QUEUED/RETRY rows
-// into actual extraction + kernel routing work. On any failure it lets
-// logstore.MarkFailed decide retry-with-backoff vs permanent FAILED,
-// rather than silently dropping the turn the way the old code did.
+// into actual extraction + kernel routing work.
 func runWorker(id int, sqliteDB, pgDB *sql.DB, stop <-chan struct{}) {
 	for {
 		select {
@@ -240,7 +238,6 @@ func runWorker(id int, sqliteDB, pgDB *sql.DB, stop <-chan struct{}) {
 			return
 		default:
 		}
-
 		job, err := logstore.ClaimNextJob(sqliteDB)
 		if err == logstore.ErrNoJobAvailable {
 			time.Sleep(500 * time.Millisecond)
@@ -248,18 +245,16 @@ func runWorker(id int, sqliteDB, pgDB *sql.DB, stop <-chan struct{}) {
 		}
 		if err != nil {
 			log.Printf("[Worker %d] claim error: %v", id, err)
-			time.Sleep(1 * time.Second)
+			time.Sleep(time.Second)
 			continue
 		}
-
-		if procErr := processJob(sqliteDB, pgDB, job); procErr != nil {
-			log.Printf("[Worker %d] job %d (turn %s) failed: %v", id, job.ID, job.TurnID, procErr)
-			if markErr := logstore.MarkFailed(sqliteDB, job, procErr); markErr != nil {
+		if err := processJob(sqliteDB, pgDB, job); err != nil {
+			log.Printf("[Worker %d] job %d (turn %s) failed: %v", id, job.ID, job.TurnID, err)
+			if markErr := logstore.MarkFailed(sqliteDB, job, err); markErr != nil {
 				log.Printf("[Worker %d] failed to record failure for job %d: %v", id, job.ID, markErr)
 			}
 			continue
 		}
-
 		if err := logstore.MarkCompleted(sqliteDB, job.ID); err != nil {
 			log.Printf("[Worker %d] failed to mark job %d completed: %v", id, job.ID, err)
 		}
@@ -267,42 +262,36 @@ func runWorker(id int, sqliteDB, pgDB *sql.DB, stop <-chan struct{}) {
 }
 
 func processJob(sqliteDB, pgDB *sql.DB, job *logstore.Job) error {
-	var t lemn.TurnPayload
-	if err := json.Unmarshal(job.RawPayload, &t); err != nil {
+	var turn lemn.TurnPayload
+	if err := json.Unmarshal(job.RawPayload, &turn); err != nil {
 		return fmt.Errorf("corrupt job payload: %w", err)
 	}
-
-	extraction, err := runZeroShotExtraction(t, pgDB)
+	extraction, err := runZeroShotExtraction(turn, pgDB)
 	if err != nil {
 		return fmt.Errorf("extraction failed: %w", err)
 	}
-
-	toolCallsJSON, _ := json.Marshal(t.ToolCalls)
+	toolCallsJSON, _ := json.Marshal(turn.ToolCalls)
 	rawJSON, _ := json.Marshal(extraction)
-
 	_, err = sqliteDB.Exec(`
 		INSERT OR REPLACE INTO turns (id, user_message, assistant_response, tool_calls, is_memory_worthy, memory_type, extracted_summary, confidence, human_reviewed, raw_llm_json)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, ?)`,
-		t.ID, t.UserMessage, t.AssistantResponse, string(toolCallsJSON),
+		turn.ID, turn.UserMessage, turn.AssistantResponse, string(toolCallsJSON),
 		extraction.MemoryWorthy, extraction.Type, extraction.Summary, extraction.Confidence, string(rawJSON),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite write failed: %w", err)
 	}
-
 	if pgDB == nil {
 		return nil
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(lemn.WithBackgroundEmbeddings(context.Background()), 15*time.Second)
 	defer cancel()
-
-	memID, err := lemn.RouteExtraction(ctx, pgDB, t, extraction)
+	memoryID, err := lemn.RouteExtraction(ctx, pgDB, turn, extraction)
 	if err != nil {
 		return fmt.Errorf("kernel routing failed: %w", err)
 	}
-	if memID != 0 {
-		log.Printf("Turn %s routed to memory #%d", t.ID, memID)
+	if memoryID != 0 {
+		log.Printf("Turn %s routed to memory #%d", turn.ID, memoryID)
 	}
 	return nil
 }
@@ -402,10 +391,34 @@ Rules:
 Memory scope: %s`, turnJSON, scope)
 }
 
+func explicitRememberClaim(userMessage string) string {
+	message := strings.TrimSpace(userMessage)
+	lower := strings.ToLower(message)
+	for strings.HasPrefix(lower, "sorry") {
+		message = strings.TrimSpace(strings.TrimLeft(message[len("sorry"):], " ,:;.!?\t\n"))
+		lower = strings.ToLower(message)
+	}
+	if !strings.HasPrefix(lower, "remember") {
+		return ""
+	}
+	claim := strings.TrimSpace(message[len("remember"):])
+	if strings.HasPrefix(strings.ToLower(claim), "that ") {
+		claim = strings.TrimSpace(claim[len("that"):])
+	}
+	return strings.TrimSpace(strings.TrimRight(claim, " \t\r\n.!?"))
+}
+
 func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtraction, error) {
-	memoryWorthy, probability, globallyApplicable, globalProbability, err := decideMemoryWorthiness(t)
-	if err != nil {
-		return lemn.ModelExtraction{}, err
+	declaredClaim := explicitRememberClaim(t.UserMessage)
+	memoryWorthy, probability, globallyApplicable, globalProbability := false, 0.0, false, 0.0
+	var err error
+	if declaredClaim != "" {
+		memoryWorthy, probability = true, 1
+	} else {
+		memoryWorthy, probability, globallyApplicable, globalProbability, err = decideMemoryWorthiness(t)
+		if err != nil {
+			return lemn.ModelExtraction{}, err
+		}
 	}
 	explicitGlobal := lemn.DetectExplicitGlobalPreference(t.UserMessage)
 	globallyApplicable = globallyApplicable || explicitGlobal
@@ -428,8 +441,12 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 		Summary    string  `json:"summary"`
 		Confidence float64 `json:"confidence"`
 	}
-	if err := requestExtractionJSON(prompt, &payload); err != nil {
-		return lemn.ModelExtraction{}, fmt.Errorf("invalid extraction JSON: %w", err)
+	if declaredClaim != "" {
+		payload.Type = "decision"
+		payload.Summary = "User-declared project fact: " + declaredClaim
+		payload.Confidence = 1
+	} else if err := requestExtractionJSON(prompt, &payload); err != nil {
+		return lemn.ModelExtraction{}, err
 	}
 
 	// Type "none" is the extraction model's own veto: Laya thought the turn
@@ -444,7 +461,7 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 
 	var dependencyCandidates []lemn.DependencyCandidate
 	if pgDB != nil {
-		candidateCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		candidateCtx, cancel := context.WithTimeout(lemn.WithBackgroundEmbeddings(context.Background()), 10*time.Second)
 		dependencyCandidates, err = lemn.ListDependencyCandidates(candidateCtx, pgDB, scope, 40)
 		cancel()
 		if err != nil {
@@ -455,9 +472,13 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 	for index, candidate := range dependencyCandidates {
 		dependencyIDs[index] = candidate.ID
 	}
-	dependsOn, equivalent, err := resolveDependencies(payload.Type, payload.Summary, dependencyCandidates)
-	if err != nil {
-		return lemn.ModelExtraction{}, fmt.Errorf("dependency resolution failed: %w", err)
+	var dependsOn []int
+	equivalent := false
+	if declaredClaim == "" {
+		dependsOn, equivalent, err = resolveDependencies(payload.Type, payload.Summary, dependencyCandidates)
+		if err != nil {
+			return lemn.ModelExtraction{}, fmt.Errorf("dependency resolution failed: %w", err)
+		}
 	}
 
 	relation := "independent"
@@ -465,7 +486,7 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 	relationCandidates := make([]lemn.MatchTarget, 0)
 	var summaryEmbedding []float32
 	if pgDB != nil && !equivalent {
-		searchCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		searchCtx, cancel := context.WithTimeout(lemn.WithBackgroundEmbeddings(context.Background()), 10*time.Second)
 		relationCandidates, summaryEmbedding, err = lemn.FindSimilarAuthoritative(searchCtx, pgDB, payload.Summary, scope)
 		cancel()
 		if err != nil {
@@ -474,7 +495,7 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 		if relationCandidates == nil {
 			relationCandidates = make([]lemn.MatchTarget, 0)
 		}
-		if len(relationCandidates) > 0 && !equivalent {
+		if len(relationCandidates) > 0 && !equivalent && declaredClaim == "" {
 			relation, targetID, err = classifyRelation(t, payload.Summary, relationCandidates)
 			if err != nil {
 				return lemn.ModelExtraction{}, fmt.Errorf("relation classification failed for turn %s: %w", t.ID, err)
@@ -483,9 +504,10 @@ func runZeroShotExtraction(t lemn.TurnPayload, pgDB *sql.DB) (lemn.ModelExtracti
 	}
 	return lemn.ModelExtraction{
 		MemoryWorthy:           true,
+		UserDeclared:           declaredClaim != "",
 		GateFallback:           gateFallback,
 		ModelEquivalent:        equivalent,
-		GatePassed:             memoryWorthy,
+		GatePassed:             memoryWorthy && declaredClaim == "",
 		GlobalScoped:           globallyApplicable,
 		GlobalScopeExplicit:    explicitGlobal,
 		GlobalProbability:      globalProbability,
@@ -579,7 +601,10 @@ func requestExtractionJSON(prompt string, payload any) error {
 	if len(result.Choices) == 0 {
 		return fmt.Errorf("empty extraction choices")
 	}
-	return json.Unmarshal([]byte(result.Choices[0].Message.Content), payload)
+	if err := json.Unmarshal([]byte(result.Choices[0].Message.Content), payload); err != nil {
+		return fmt.Errorf("invalid extraction JSON: %w", err)
+	}
+	return nil
 }
 
 func resolveDependencies(extractionType, summary string, candidates []lemn.DependencyCandidate) ([]int, bool, error) {

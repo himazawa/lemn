@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"lemnd/internal/admission"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -55,6 +58,48 @@ func TestStreamingBudgetReportedAfterUsage(t *testing.T) {
 				t.Fatalf("proxy produced a non-JSON SSE message: %q", message)
 			}
 		}
+	}
+}
+
+func TestEmbeddingProxyPreservesRequestAndBackendResponse(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer backend-test" {
+			t.Error("backend authorization missing")
+		}
+		body, _ := io.ReadAll(request.Body)
+		if string(body) != `{"model":"bge-m3-mlx-fp16","input":"query"}` {
+			t.Errorf("request body = %s", body)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusServiceUnavailable)
+		io.WriteString(writer, `{"error":"busy"}`)
+	}))
+	defer backend.Close()
+	t.Setenv("LEMN_EMBEDDING_URL", backend.URL)
+	oldKey := backendAPIKey
+	backendAPIKey = "backend-test"
+	t.Cleanup(func() { backendAPIKey = oldKey })
+	response := httptest.NewRecorder()
+	handleEmbeddings(response, httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(`{"model":"bge-m3-mlx-fp16","input":"query"}`)))
+	if response.Code != http.StatusServiceUnavailable || response.Body.String() != `{"error":"busy"}` {
+		t.Fatalf("response = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestBackgroundEmbeddingDefersBehindForeground(t *testing.T) {
+	oldGate := modelAdmission
+	modelAdmission = admission.New()
+	t.Cleanup(func() { modelAdmission = oldGate })
+	_, release, err := modelAdmission.Acquire(context.Background(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	response := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/internal/embeddings", strings.NewReader(`{"input":"query"}`))
+	admittedEmbedding(true)(response, request)
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") == "" {
+		t.Fatalf("response = %d headers=%v", response.Code, response.Header())
 	}
 }
 

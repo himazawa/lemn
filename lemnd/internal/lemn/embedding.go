@@ -11,6 +11,14 @@ import (
 	"os"
 )
 
+type embeddingContextKey struct{}
+
+// WithBackgroundEmbeddings marks vector work performed by durable workers so
+// it yields to interactive retrieval and chat on the shared model broker.
+func WithBackgroundEmbeddings(ctx context.Context) context.Context {
+	return context.WithValue(ctx, embeddingContextKey{}, true)
+}
+
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -20,6 +28,9 @@ func getenv(key, def string) string {
 
 func getEmbedding(ctx context.Context, text string) ([]float32, error) {
 	endpoint := getenv("LEMN_EMBEDDING_URL", "http://localhost:8001/v1/embeddings")
+	if background, _ := ctx.Value(embeddingContextKey{}).(bool); background {
+		endpoint = getenv("LEMN_EMBEDDING_BACKGROUND_URL", endpoint)
+	}
 
 	reqBody, _ := json.Marshal(map[string]any{
 		"model": getenv("LEMN_EMBEDDING_MODEL", "bge-m3"),
@@ -31,7 +42,11 @@ func getEmbedding(ctx context.Context, text string) ([]float32, error) {
 		return nil, fmt.Errorf("failed to build embedding request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if key := os.Getenv("LEMN_BACKEND_API_KEY"); key != "" {
+	key := os.Getenv("LEMN_BACKEND_API_KEY")
+	if getenv("LEMN_EMBEDDING_VIA_ROUTER", "false") == "true" {
+		key = os.Getenv("LEMN_SHARED_SECRET")
+	}
+	if key != "" {
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
 

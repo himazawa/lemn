@@ -36,6 +36,46 @@ func TestEmbeddingResponseValidation(t *testing.T) {
 	}
 }
 
+func TestBackgroundEmbeddingUsesBackgroundEndpoint(t *testing.T) {
+	called := ""
+	foreground := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		called = "foreground"
+		writer.Write([]byte(`{"data":[{"embedding":[1]}]}`))
+	}))
+	defer foreground.Close()
+	background := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		called = "background"
+		writer.Write([]byte(`{"data":[{"embedding":[1]}]}`))
+	}))
+	defer background.Close()
+	t.Setenv("LEMN_EMBEDDING_URL", foreground.URL)
+	t.Setenv("LEMN_EMBEDDING_BACKGROUND_URL", background.URL)
+	if _, err := getEmbedding(context.Background(), "query"); err != nil || called != "foreground" {
+		t.Fatalf("foreground endpoint=%s error=%v", called, err)
+	}
+	called = ""
+	if _, err := getEmbedding(WithBackgroundEmbeddings(context.Background()), "query"); err != nil || called != "background" {
+		t.Fatalf("background endpoint=%s error=%v", called, err)
+	}
+}
+
+func TestEmbeddingBrokerUsesSharedSecret(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") != "Bearer lemn-shared" {
+			t.Errorf("broker auth header not set from shared secret")
+		}
+		writer.Write([]byte(`{"data":[{"embedding":[1]}]}`))
+	}))
+	defer server.Close()
+	t.Setenv("LEMN_EMBEDDING_URL", server.URL)
+	t.Setenv("LEMN_EMBEDDING_VIA_ROUTER", "true")
+	t.Setenv("LEMN_BACKEND_API_KEY", "backend-key")
+	t.Setenv("LEMN_SHARED_SECRET", "lemn-shared")
+	if _, err := getEmbedding(context.Background(), "query"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEmbeddingBackendParity(t *testing.T) {
 	oldURL, newURL := os.Getenv("LEMN_PARITY_OLD_URL"), os.Getenv("LEMN_PARITY_NEW_URL")
 	if oldURL == "" || newURL == "" {

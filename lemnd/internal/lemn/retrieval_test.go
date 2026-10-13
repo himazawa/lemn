@@ -65,7 +65,7 @@ func TestSelectRetrievalResults(t *testing.T) {
 			name:       "best at floor boundary falls back",
 			candidates: []RetrievedMemory{mem(1, 0.35), mem(2, 0.34)},
 			limit:      5,
-			wantIDs:    []int{1, 2},
+			wantIDs:    []int{1},
 			wantBelow:  true,
 		},
 		{
@@ -105,6 +105,32 @@ func TestSelectRetrievalResultsZeroMarginDisablesFallback(t *testing.T) {
 	)
 	if len(got) != 0 {
 		t.Fatalf("len = %d, want 0 (fallback should be disabled at margin 0)", len(got))
+	}
+}
+
+func TestDeduplicateRetrievedSummariesKeepsBestRankedAndFillsSlots(t *testing.T) {
+	candidates := []RetrievedMemory{
+		{ID: 1, ProjectID: GlobalScope, Summary: "The user prefers metric units in every project.", Similarity: 0.367},
+		{ID: 2, ProjectID: GlobalScope, Summary: " the USER   prefers metric units in every project. ", Similarity: 0.366},
+		{ID: 3, ProjectID: "dpm", Summary: "The HP decoder uses a varint length prefix.", Similarity: 0.36},
+		{ID: 4, ProjectID: "dpm", Summary: "The missed-spawn HP test consumes 17 bytes.", Similarity: 0.35},
+		{ID: 5, ProjectID: "dpm", Summary: "The user prefers metric units in every project.", Similarity: 0.351},
+	}
+	got := selectRetrievalResults(deduplicateRetrievedSummaries(candidates), 0.45, 0.10, 4)
+	if len(got) != 4 || got[0].ID != 1 || got[1].ID != 3 || got[2].ID != 4 || got[3].ID != 5 {
+		t.Fatalf("deduplicated results = %+v", got)
+	}
+}
+
+func TestFallbackDoesNotReturnCandidatesBelowFloor(t *testing.T) {
+	candidates := []RetrievedMemory{
+		{ID: 1, Summary: "nearest", Similarity: 0.367},
+		{ID: 2, Summary: "unrelated one", Similarity: 0.306},
+		{ID: 3, Summary: "unrelated two", Similarity: 0.286},
+	}
+	got := selectRetrievalResults(candidates, 0.45, 0.10, 5)
+	if len(got) != 1 || got[0].ID != 1 || !got[0].BelowThreshold {
+		t.Fatalf("fallback returned unrelated candidates: %+v", got)
 	}
 }
 

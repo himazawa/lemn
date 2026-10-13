@@ -1,6 +1,7 @@
 package logstore
 
 import (
+	"context"
 	"errors"
 	"lemnd/internal/backenderr"
 	"path/filepath"
@@ -19,19 +20,21 @@ func TestResourceFailuresRemainRecoverable(t *testing.T) {
 		t.Fatal(err)
 	}
 	job := &Job{ID: id, MaxAttempts: 5}
-	for count := 0; count < 10; count++ {
-		if err := MarkFailed(db, job, &backenderr.ResourceError{Status: 507}); err != nil {
-			t.Fatal(err)
+	for _, cause := range []error{&backenderr.ResourceError{Status: 507}, context.Canceled} {
+		for count := 0; count < 6; count++ {
+			if err := MarkFailed(db, job, cause); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	var state string
-	var attempts int
-	var deferred bool
-	if err := db.QueryRow(`SELECT status, attempts, available_at > CURRENT_TIMESTAMP FROM memory_jobs WHERE id = ?`, id).Scan(&state, &attempts, &deferred); err != nil {
+	var attempts, deferrals int
+	var backedOff bool
+	if err := db.QueryRow(`SELECT status, attempts, deferrals, available_at >= datetime(CURRENT_TIMESTAMP, '+480 seconds') FROM memory_jobs WHERE id = ?`, id).Scan(&state, &attempts, &deferrals, &backedOff); err != nil {
 		t.Fatal(err)
 	}
-	if state != "RETRY" || attempts != 0 || !deferred {
-		t.Fatalf("state=%s attempts=%d deferred=%t", state, attempts, deferred)
+	if state != "RETRY" || attempts != 0 || deferrals != 12 || !backedOff {
+		t.Fatalf("state=%s attempts=%d deferrals=%d backedOff=%t", state, attempts, deferrals, backedOff)
 	}
 	job.Attempts = 4
 	if err := MarkFailed(db, job, errors.New("invalid extraction JSON")); err != nil {

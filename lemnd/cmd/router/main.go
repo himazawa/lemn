@@ -109,14 +109,14 @@ var modelAdmission = admission.New()
 
 func admittedChat(background bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		release, err := modelAdmission.Acquire(r.Context(), background)
+		admittedCtx, release, err := modelAdmission.Acquire(r.Context(), background)
 		if err != nil {
 			w.Header().Set("Retry-After", "30")
 			http.Error(w, "model admission unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		defer release()
-		handleChatCompletions(w, r)
+		handleChatCompletions(w, r.WithContext(admittedCtx))
 	}
 }
 
@@ -165,6 +165,12 @@ func main() {
 
 	http.HandleFunc("/v1/chat/completions", authmw.Require(sharedSecret, admittedChat(false)))
 	http.HandleFunc("/internal/extraction", authmw.Require(sharedSecret, admittedChat(true)))
+	http.HandleFunc("/v1/embeddings", authmw.Require(sharedSecret, admittedEmbedding(false)))
+	http.HandleFunc("/internal/embeddings", authmw.Require(sharedSecret, admittedEmbedding(true)))
+	http.HandleFunc("/internal/admission", authmw.Require(sharedSecret, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(modelAdmission.Snapshot())
+	}))
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("ok"))
 	})
@@ -172,6 +178,55 @@ func main() {
 	log.Printf("LEMN model router listening on %s (fast=%s, heavy=%s, laya=%s)",
 		routerBind, fastModelURL, heavyModelURL, layaEndpoint)
 	log.Fatal(http.ListenAndServe(routerBind, nil))
+}
+
+func admittedEmbedding(background bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		admittedCtx, release, err := modelAdmission.Acquire(r.Context(), background)
+		if err != nil {
+			w.Header().Set("Retry-After", "30")
+			http.Error(w, "embedding backend busy", http.StatusServiceUnavailable)
+			return
+		}
+		defer release()
+		handleEmbeddings(w, r.WithContext(admittedCtx))
+	}
+}
+
+func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<20))
+	if err != nil {
+		http.Error(w, "failed to read embedding request", http.StatusBadRequest)
+		return
+	}
+	upstream, err := http.NewRequestWithContext(r.Context(), http.MethodPost, getenv("LEMN_EMBEDDING_URL", "http://host.docker.internal:9001/v1/embeddings"), bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, "failed to construct embedding request", http.StatusInternalServerError)
+		return
+	}
+	upstream.Header.Set("Content-Type", "application/json")
+	if backendAPIKey != "" {
+		upstream.Header.Set("Authorization", "Bearer "+backendAPIKey)
+	}
+	response, err := http.DefaultClient.Do(upstream)
+	if err != nil {
+		http.Error(w, "embedding backend unavailable", http.StatusBadGateway)
+		return
+	}
+	defer response.Body.Close()
+	for key, values := range response.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(response.StatusCode)
+	if _, err := io.Copy(w, response.Body); err != nil {
+		log.Printf("[Router] embedding response copy failed: %v", err)
+	}
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 )
 
 // Calibrated for bge-m3: question-vs-statement similarity peaks near 0.55, so
@@ -75,6 +76,9 @@ func selectRetrievalResults(candidates []RetrievedMemory, threshold, fallbackMar
 	if candidates[0].Similarity >= threshold-fallbackMargin {
 		fallback := make([]RetrievedMemory, 0, limit)
 		for _, c := range candidates {
+			if c.Similarity < threshold-fallbackMargin {
+				break
+			}
 			c.BelowThreshold = true
 			fallback = append(fallback, c)
 			if len(fallback) >= limit {
@@ -85,6 +89,23 @@ func selectRetrievalResults(candidates []RetrievedMemory, threshold, fallbackMar
 	}
 
 	return []RetrievedMemory{}
+}
+
+func deduplicateRetrievedSummaries(candidates []RetrievedMemory) []RetrievedMemory {
+	seen := make(map[string]struct{}, len(candidates))
+	unique := make([]RetrievedMemory, 0, len(candidates))
+	for _, candidate := range candidates {
+		key := candidate.ProjectID + "\x00" + strings.ToLower(strings.Join(strings.Fields(candidate.Summary), " "))
+		if key == "" {
+			key = fmt.Sprintf("memory:%d", candidate.ID)
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, candidate)
+	}
+	return unique
 }
 
 func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string, projectID string, limit int) ([]RetrievedMemory, error) {
@@ -103,6 +124,10 @@ func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string
 	// The threshold is NOT applied in SQL: we fetch the top `limit` ranked
 	// candidates and let selectRetrievalResults apply the threshold and the
 	// near-miss fallback, so a single query serves both paths.
+	candidateLimit := limit * 5
+	if candidateLimit > 100 {
+		candidateLimit = 100
+	}
 	query := `
 		SELECT id, project_id, category, summary, 1 - (embedding <=> $1::vector) as similarity
 		FROM lemn_memories
@@ -111,7 +136,7 @@ func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string
 		ORDER BY similarity DESC
 		LIMIT $2;`
 
-	rows, err := db.QueryContext(ctx, query, string(embeddingJSON), limit, NormalizeScope(projectID), GlobalScope)
+	rows, err := db.QueryContext(ctx, query, string(embeddingJSON), candidateLimit, NormalizeScope(projectID), GlobalScope)
 	if err != nil {
 		return nil, fmt.Errorf("vector similarity query failed: %w", err)
 	}
@@ -129,5 +154,5 @@ func QueryAuthoritativeMemories(ctx context.Context, db *sql.DB, queryStr string
 		return nil, fmt.Errorf("vector similarity iteration failed: %w", err)
 	}
 
-	return selectRetrievalResults(candidates, retrievalThreshold(), retrievalFallbackMargin(), limit), nil
+	return selectRetrievalResults(deduplicateRetrievedSummaries(candidates), retrievalThreshold(), retrievalFallbackMargin(), limit), nil
 }

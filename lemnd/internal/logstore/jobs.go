@@ -82,9 +82,15 @@ func MarkCompleted(db *sql.DB, jobID int64) error {
 func MarkFailed(db *sql.DB, job *Job, cause error) error {
 	var resource *backenderr.ResourceError
 	var network net.Error
-	if errors.As(cause, &resource) || errors.As(cause, &network) || errors.Is(cause, context.DeadlineExceeded) {
-		delay := 30 + rand.Intn(31)
-		_, err := db.Exec(`UPDATE memory_jobs SET status = 'RETRY', error = ?, locked_at = NULL, available_at = datetime(CURRENT_TIMESTAMP, ?) WHERE id = ?`, cause.Error(), fmt.Sprintf("+%d seconds", delay), job.ID)
+	if errors.As(cause, &resource) || errors.As(cause, &network) || errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, context.Canceled) {
+		// Deferrals don't consume attempts, but back off 30s→8m so a busy backend isn't hammered.
+		_, err := db.Exec(`
+			UPDATE memory_jobs
+			SET status = 'RETRY', error = ?, locked_at = NULL, deferrals = deferrals + 1,
+			    available_at = datetime(CURRENT_TIMESTAMP, '+' || (30 * (1 << min(deferrals, 4)) + ?) || ' seconds')
+			WHERE id = ?`,
+			cause.Error(), rand.Intn(31), job.ID,
+		)
 		return err
 	}
 	attempts := job.Attempts + 1

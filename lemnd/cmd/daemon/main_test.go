@@ -88,6 +88,29 @@ func TestHandleJobStatus(t *testing.T) {
 	})
 }
 
+func TestExplicitRememberClaimIsDeterministic(t *testing.T) {
+	for input, want := range map[string]string{
+		"remember that the value of y is 2": "the value of y is 2",
+		"Sorry, remember that y is y.":      "y is y",
+		"remember use metric units":         "use metric units",
+		"for this task, inspect HP":         "",
+	} {
+		if got := explicitRememberClaim(input); got != want {
+			t.Errorf("explicitRememberClaim(%q)=%q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestExplicitRememberBypassesFlakyClassifiers(t *testing.T) {
+	mockExtractionServices(t, func(prompt string) (string, int) {
+		t.Error("explicit declaration should not call an LLM extractor")
+		return "", http.StatusInternalServerError
+	}, false)
+	got, err := runZeroShotExtraction(lemn.TurnPayload{ProjectID: "dpm", UserMessage: "sorry remember that the value of y is 2"}, nil)
+	if err != nil || !got.MemoryWorthy || !got.UserDeclared || got.GatePassed || got.Type != "decision" || got.Summary != "User-declared project fact: the value of y is 2" {
+		t.Fatalf("extraction=%+v err=%v", got, err)
+	}
+}
 func TestValidateRelationChoice(t *testing.T) {
 	candidates := []lemn.MatchTarget{{ID: 12}, {ID: 24}}
 	tests := []struct {
@@ -221,7 +244,7 @@ func TestDPMExtractionInputs(t *testing.T) {
 		{"validated HP report", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "For this task only, investigate the test.", AssistantResponse: "The HP test passes; framing consumes value - 4 + varint width. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}, "architecture", "HP framing consumes value - 4 + varint width; the missed-spawn HP test passes."},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			mockExtractionServices(t, func(prompt string) (string, int) {
+			prompts := mockExtractionServices(t, func(prompt string) (string, int) {
 				if !strings.Contains(prompt, test.turn.UserMessage) || !strings.Contains(prompt, "user-declared project fact") || !strings.Contains(prompt, "validated project behavior") {
 					t.Error("extraction contract omits source or durable fact rules")
 				}
@@ -229,6 +252,12 @@ func TestDPMExtractionInputs(t *testing.T) {
 				return string(body), http.StatusOK
 			})
 			got, err := runZeroShotExtraction(test.turn, nil)
+			if test.name == "explicit remember" {
+				if err != nil || !got.MemoryWorthy || !got.UserDeclared || got.GatePassed || got.Summary != "User-declared project fact: the value of y is 2" || len(*prompts) != 0 {
+					t.Fatalf("explicit extraction = %+v, error = %v, model calls = %d", got, err, len(*prompts))
+				}
+				return
+			}
 			if err != nil || !got.MemoryWorthy || got.Type != test.typ || got.Summary != test.summary || got.GlobalScoped {
 				t.Fatalf("extraction = %+v, error = %v", got, err)
 			}

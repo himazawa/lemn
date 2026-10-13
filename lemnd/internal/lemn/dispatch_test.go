@@ -32,6 +32,15 @@ func TestExtractionState(t *testing.T) {
 	}
 }
 
+func TestUserDeclaredCorrectionStillRequiresReview(t *testing.T) {
+	if got := extractionStateForClaim(true, "independent", false, true); got != "PENDING_CONFIRMATION" {
+		t.Fatalf("user-declared correction state = %q, want PENDING_CONFIRMATION", got)
+	}
+	if got := extractionStateForClaim(false, "independent", false, true); got != "CANDIDATE" {
+		t.Fatalf("simple user declaration state = %q, want CANDIDATE", got)
+	}
+}
+
 func TestAutoPromoteState(t *testing.T) {
 	t.Setenv("LEMN_PROMOTE_THRESHOLD", "")
 	t.Setenv("LEMN_ALLOW_CONFIDENCE_PROMOTION", "false")
