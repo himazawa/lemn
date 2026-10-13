@@ -80,6 +80,19 @@ uses the same transaction as human confirmation. If a relation target is
 invalid, LEMN treats the claim as independent and applies the normal promotion
 rules.
 
+Extraction receives bounded, turn-local tool excerpts alongside the user and
+assistant text, and produces at most one summary per turn. A user message
+beginning with `remember` skips the Laya and extraction-model calls and is stored
+as a **user-declared** fact; it is not independent verification, and duplicate or
+conflicting candidates still go to review. Reports with tool evidence that the
+worthiness gate rejects get a second extraction review. The extractor can still
+return `none`, and plans are not treated as completed work.
+
+The Pi extension waits up to five seconds for `/log` to acknowledge the enqueue.
+Acknowledgment means **queued**, not saved or authoritative. In Pi, `/lemn-job`
+reports whether the last acknowledged job is waiting, processing, failed,
+rejected, or processed.
+
 ## Memory read path
 
 Before each turn, the Pi extension asks the daemon for memories that match the
@@ -90,9 +103,14 @@ best result is within `LEMN_RETRIEVAL_FALLBACK_MARGIN`, LEMN returns the top
 results with `below_threshold` set. Otherwise it returns an empty list. Pi adds
 the memories as a separate message and leaves the user's text unchanged.
 
-Retrieval failures return an empty result instead of failing the conversation.
-An empty result may mean no close authoritative memories, or it may mean
-retrieval failed. Check daemon logs for `[Retrieval Error]`.
+Retrieval backend or database failures return HTTP 503, distinct from an empty
+match list. Pi reports that memory retrieval is unavailable and continues
+without injected memories. The daemon allows ten seconds for retrieval
+(`LEMN_RETRIEVAL_TIMEOUT`) and Pi five seconds for the read. Embedding responses
+with an error status or empty or non-finite vectors are rejected.
+
+LEMN does not compact Pi's transcript; conversation length is managed by Pi or
+any context tooling you run alongside it.
 
 ## Lifecycle and graph safety
 

@@ -112,9 +112,9 @@ func TestDeduplicateRetrievedSummariesKeepsBestRankedAndFillsSlots(t *testing.T)
 	candidates := []RetrievedMemory{
 		{ID: 1, ProjectID: GlobalScope, Summary: "The user prefers metric units in every project.", Similarity: 0.367},
 		{ID: 2, ProjectID: GlobalScope, Summary: " the USER   prefers metric units in every project. ", Similarity: 0.366},
-		{ID: 3, ProjectID: "dpm", Summary: "The HP decoder uses a varint length prefix.", Similarity: 0.36},
-		{ID: 4, ProjectID: "dpm", Summary: "The missed-spawn HP test consumes 17 bytes.", Similarity: 0.35},
-		{ID: 5, ProjectID: "dpm", Summary: "The user prefers metric units in every project.", Similarity: 0.351},
+		{ID: 3, ProjectID: "demo", Summary: "The HP decoder uses a varint length prefix.", Similarity: 0.36},
+		{ID: 4, ProjectID: "demo", Summary: "The missed-spawn HP test consumes 17 bytes.", Similarity: 0.35},
+		{ID: 5, ProjectID: "demo", Summary: "The user prefers metric units in every project.", Similarity: 0.351},
 	}
 	got := selectRetrievalResults(deduplicateRetrievedSummaries(candidates), 0.45, 0.10, 4)
 	if len(got) != 4 || got[0].ID != 1 || got[1].ID != 3 || got[2].ID != 4 || got[3].ID != 5 {

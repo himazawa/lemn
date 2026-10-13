@@ -8,12 +8,12 @@ requests wait
 with request cancellation support; background requests receive HTTP 503 with
 `Retry-After: 30` when another call is active or foreground work is waiting.
 The slot stays held until the response body/stream finishes or is cancelled.
-No scheduler mutex is held while performing network I/O. Running work is not
-foreground work is not preempted. If foreground work arrives during background
+No scheduler mutex is held while performing network I/O. Running foreground
+work is not preempted. If foreground work arrives during background
 extraction or embedding, the router cancels that background request; its durable
 job is returned to RETRY without consuming a content-failure attempt. A single
 router instance must own this backend; direct oMLX calls,
-other routers and independent Bili providers bypass admission.
+other routers and proxies that call the backend directly bypass admission.
 
 Compose sends daemon extraction, relation classification, and embeddings through
 the router. Pi retrieval queries use foreground `/v1/embeddings`; durable worker
@@ -27,7 +27,7 @@ authenticates to oMLX with `LEMN_BACKEND_API_KEY`.
 ## Durable Recovery
 
 HTTP 429/502/503/504/507, cancellation, and network/deadline failures return jobs to RETRY with
-30-60 seconds of jitter without consuming the content-failure attempt budget.
+exponential backoff (30s doubling to 8m, plus up to 30s jitter) without consuming the content-failure attempt budget.
 This preserves jobs through extended outages; it does not promise eventual
 completion if the backend never recovers. Other extraction failures retain the
 existing bounded attempts. Old FAILED jobs are not replayed automatically.
@@ -48,23 +48,19 @@ recoverable. Acknowledged enqueue means queued, not that this processing finishe
 
 The existing native oMLX server serves `bge-m3-mlx-fp16` (XLM-RoBERTa, BGE-M3
 CLS pooling and L2 normalization, 1024 dimensions). LEMN retains this exact model
-and vector space; no second model copy or re-embedding is needed.
+and vector space; no second model copy or re-embedding is needed. A different
+model requires measured retrieval parity and, if incompatible, an explicit
+re-embedding migration; matching dimensions alone are not enough.
 
 Compose routes foreground retrieval through `/v1/embeddings` and worker-created
 vectors through `/internal/embeddings`. Both use the shared admission slot with
 chat and extraction. This prevents concurrent LEMN requests from stacking model
 loads, but does not isolate oMLX from other clients or create more system memory.
+A separate CPU embedding service needs measured Apple Silicon performance and
+vector parity against existing stored memories before it replaces this endpoint.
 
-The previous TEI CPU-container experiment was stopped and removed: BGE-M3's ONNX
-artifacts returned repeated 404s. It was never activated. A separate CPU service
-should be reconsidered only with a working artifact, measured Apple Silicon
-performance, and vector parity against existing stored memories.
-
-The native endpoint and one live retrieval request were observed to return HTTP
-200; retrieval took 0.72 seconds. The returned memories were unrelated global
-preferences below threshold, so DPM fact recall remains unverified. Retrieval has
-a two-second daemon deadline and Pi a five-second read deadline; test real DPM
-queries and stored summaries before claiming recall is fixed.
+Retrieval has a ten-second daemon deadline (`LEMN_RETRIEVAL_TIMEOUT`) and Pi a
+five-second read deadline.
 
 ## Deployment
 
@@ -75,7 +71,3 @@ the router so streams are not interrupted:
 ```sh
 docker compose up -d --build router daemon
 ```
-
-Historical DPM recovery should follow successful live extraction and embedding
-checks. Review the candidates in dpm-memory-audit.md rather than creating
-authoritative memories from old reports without verification.

@@ -256,8 +256,13 @@ Child retrieval uses the session working directory to derive project scope;
 same daemon URL and inherited `LEMN_SHARED_SECRET`; never put secrets in agent
 prompts. An agent-specific `subagentOnlyExtensions` policy can override these
 defaults; include the read-only entry point there as well. This does not configure
-model routing or billion-context inheritance. Hook contracts can be tested with
+model routing. Hook contracts can be tested with
 `node scripts/test_pi_memory_modes.mjs` using the installed package's Jiti loader.
+
+Children should report established facts separately from hypotheses, with
+changed files and validation results. Child tool evidence is not copied into the
+parent's memory log: the parent should inspect diffs or test results itself, or
+a summarized child report may become an unbacked candidate that needs review.
 
 ## Admin commands
 

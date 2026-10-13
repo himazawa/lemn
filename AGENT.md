@@ -16,7 +16,7 @@ when your host expects `AGENTS.md` or another instruction filename.
 - `pi-extension`: maintained Pi memory extension and child-only read wrapper.
 - `.pi/extensions/lemn`: installed workspace copy; keep behavior aligned when editing.
 - `schema.sql`: PostgreSQL/pgvector schema; current embedding dimension is 1024.
-- `docs`: architecture, operations, evaluation, resource scheduling and DPM audit.
+- `docs`: architecture, operations, evaluation and resource scheduling.
 
 ## Working Rules
 
@@ -58,10 +58,8 @@ malformed content still needs bounded retries. Explain starvation and direct-bac
 bypass limits rather than claiming universal coordination or deadlock elimination.
 
 Embedding changes require vector-space validation, not just dimensional agreement.
-Measure latency and compare stored-summary retrieval before switching. The optional
-TEI CPU container is staged and emulated on Apple Silicon; native ARM64 is a possible
-deployment alternative, not an implemented service. Never activate an incompatible
-endpoint without a reviewed re-embedding migration.
+Measure latency and compare stored-summary retrieval before switching. Never
+activate an incompatible endpoint without a reviewed re-embedding migration.
 
 Keep secrets out of tool output and logs. Respect protected environment-file access;
 ask the user to update credentials directly. Do not increase Metal limits, clear
@@ -82,14 +80,12 @@ From repository root:
 ```sh
 node scripts/test_pi_memory_modes.mjs
 docker compose config --quiet
-docker compose -f docker-compose.yml -f docker-compose.embeddings.yml \
-  -f docker-compose.embeddings-active.yml config --quiet
 git diff --check
 ```
 
 The Pi mock harness requires the installed user `pi-subagents`/`jiti` dependency.
 Check test database prerequisites for PostgreSQL integration coverage. Live checks
-are opt-in: `TestDPMExtractionLive` in the daemon and `TestEmbeddingBackendParity`
+are opt-in: `TestExtractionLive` in the daemon and `TestEmbeddingBackendParity`
 in the kernel. Read their prerequisites and use credentials in the environment,
 never in published commands or output. Do not describe mocked tests as proof of
 real model recall. Record any skipped or failing live verification explicitly.

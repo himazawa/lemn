@@ -106,7 +106,7 @@ func TestExplicitRememberBypassesFlakyClassifiers(t *testing.T) {
 		t.Error("explicit declaration should not call an LLM extractor")
 		return "", http.StatusInternalServerError
 	}, false)
-	got, err := runZeroShotExtraction(lemn.TurnPayload{ProjectID: "dpm", UserMessage: "sorry remember that the value of y is 2"}, nil)
+	got, err := runZeroShotExtraction(lemn.TurnPayload{ProjectID: "demo", UserMessage: "sorry remember that the value of y is 2"}, nil)
 	if err != nil || !got.MemoryWorthy || !got.UserDeclared || got.GatePassed || got.Type != "decision" || got.Summary != "User-declared project fact: the value of y is 2" {
 		t.Fatalf("extraction=%+v err=%v", got, err)
 	}
@@ -219,29 +219,29 @@ func TestRetrieveUnavailableReturnsServiceError(t *testing.T) {
 }
 
 func TestExtractionPromptBoundsToolEvidence(t *testing.T) {
-	turn := lemn.TurnPayload{ProjectID: "dpm", UserMessage: "Continue the investigation.", AssistantResponse: "The HP test passes."}
+	turn := lemn.TurnPayload{ProjectID: "demo", UserMessage: "Continue the investigation.", AssistantResponse: "The HP test passes."}
 	turn.ToolCalls = append(turn.ToolCalls, lemn.ToolCallEvidence{Name: "compress", DiffText: "historical-summary-sentinel"})
 	for index := 0; index < 10; index++ {
 		turn.ToolCalls = append(turn.ToolCalls, lemn.ToolCallEvidence{Name: "bash", DiffText: strings.Repeat("x", 3000)})
 	}
-	prompt := extractionPrompt(turn, "dpm")
+	prompt := extractionPrompt(turn, "demo")
 	if strings.Contains(prompt, "historical-summary-sentinel") || strings.Count(prompt, "[excerpt truncated]") != 4 || strings.Count(prompt, "x") > 8100 {
 		t.Fatal("tool evidence was not filtered or bounded")
 	}
-	if !strings.Contains(prompt, "The HP test passes.") || !strings.Contains(prompt, "Memory scope: dpm") {
+	if !strings.Contains(prompt, "The HP test passes.") || !strings.Contains(prompt, "Memory scope: demo") {
 		t.Fatal("turn or scope missing")
 	}
 }
 
-func TestDPMExtractionInputs(t *testing.T) {
+func TestExtractionInputs(t *testing.T) {
 	for _, test := range []struct {
 		name    string
 		turn    lemn.TurnPayload
 		typ     string
 		summary string
 	}{
-		{"explicit remember", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "sorry remember that the value of y is 2", AssistantResponse: "The value of y is 2. Next we will add fixtures."}, "decision", "The user declares that y is 2."},
-		{"validated HP report", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "For this task only, investigate the test.", AssistantResponse: "The HP test passes; framing consumes value - 4 + varint width. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}, "architecture", "HP framing consumes value - 4 + varint width; the missed-spawn HP test passes."},
+		{"explicit remember", lemn.TurnPayload{ProjectID: "demo", UserMessage: "sorry remember that the value of y is 2", AssistantResponse: "The value of y is 2. Next we will add fixtures."}, "decision", "The user declares that y is 2."},
+		{"validated HP report", lemn.TurnPayload{ProjectID: "demo", UserMessage: "For this task only, investigate the test.", AssistantResponse: "The HP test passes; framing consumes value - 4 + varint width. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}, "architecture", "HP framing consumes value - 4 + varint width; the missed-spawn HP test passes."},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			prompts := mockExtractionServices(t, func(prompt string) (string, int) {
@@ -265,7 +265,7 @@ func TestDPMExtractionInputs(t *testing.T) {
 	}
 }
 
-func TestDPMExtractionLive(t *testing.T) {
+func TestExtractionLive(t *testing.T) {
 	if os.Getenv("LEMN_LIVE_EXTRACTION_TEST") != "true" {
 		t.Skip("requires an explicitly configured live extraction backend")
 	}
@@ -276,9 +276,8 @@ func TestDPMExtractionLive(t *testing.T) {
 		name string
 		turn lemn.TurnPayload
 	}{
-		{"remember", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "sorry remember that the value of y is 2", AssistantResponse: "The value of y is 2. Next we will add fixtures."}},
-		{"HP framing", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "Continue the HP packet decoder investigation.", AssistantResponse: "The missed-spawn HP test passes. Framing consumes value - 4 + varint width: value 20 and width 1 consume 17 bytes. HP scanning runs over the whole buffer. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}},
-		{"slice limitation", lemn.TurnPayload{ProjectID: "dpm", UserMessage: "Continue the fixture investigation.", AssistantResponse: "The v2.0.58 oracle reports NothingDerived for the slice. Boss entity 33962 has 616027 damage but no spawn-derived mob code, preventing boss recognition. This is a negative golden, not absence of damage packets.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "exit 1: a2t-oracle: derive: no damage derived from the slice"}}}},
+		{"remember", lemn.TurnPayload{ProjectID: "demo", UserMessage: "sorry remember that the value of y is 2", AssistantResponse: "The value of y is 2. Next we will add fixtures."}},
+		{"HP framing", lemn.TurnPayload{ProjectID: "demo", UserMessage: "Continue the HP packet decoder investigation.", AssistantResponse: "The missed-spawn HP test passes. Framing consumes value - 4 + varint width: value 20 and width 1 consume 17 bytes. HP scanning runs over the whole buffer. No fix made.", ToolCalls: []lemn.ToolCallEvidence{{Name: "bash", DiffText: "test a_dummy_whose_spawn_was_missed_is_known_by_its_hp ... ok"}}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got, err := runZeroShotExtraction(test.turn, nil)

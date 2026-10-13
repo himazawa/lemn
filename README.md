@@ -27,141 +27,13 @@ to fast or heavy models.
 The core services are Go; the Laya classifier is Python; the Pi integration is
 TypeScript. See [Architecture](docs/architecture.md) for the flow and lifecycle.
 
-## Memory guarantees and diagnostics
-
-LEMN augments Pi's context; it does **not** replace Pi's conversation history,
-compact the transcript, or guarantee that every completed task becomes a memory.
-Billion Context (Bili), when used, manages its own compression independently.
-Its model-driven compression tools and Pi's native compactor are not LEMN memory
-operations. Local Pi/Bili tuning is not installed by this repository.
-
-The Pi extension waits up to five seconds for `/log` to acknowledge durable
-enqueue. It reports submission failures and uses the current project scope for
-both reads and writes. Acceptance means **queued**, not saved or authoritative.
-In Pi, `/lemn-job` checks the last acknowledged job in the current process and
-reports waiting, processing, failed, rejected, or processed outcomes. Restart Pi
-after updating its extension. `/retrieve` is an authenticated daemon HTTP endpoint,
-not a Pi slash command.
-
-Extraction receives bounded, turn-local tool excerpts alongside user and assistant
-text. A direct user message beginning with `remember` is deterministically stored
-as a **user-declared** project fact; it bypasses flaky worthiness/extraction model
-calls, but is not independent verification. Duplicate or conflicting candidates
-can still send it to review. Other reports with tool evidence can receive a second
-extraction review when the worthiness classifier rejects them. Model-extracted
-reports can still return `none`; classifier scores and fallback provenance are
-retained. Plans are not treated as completed work. These rules improve coverage,
-not factual accuracy. One turn currently produces at most one extracted summary.
-
-Retrieved memories must be `AUTHORITATIVE`, scoped to the current project or
-`global`, and relevant to the query. A queued explicit remember becomes available
-after processing and successful embedding/retrieval; enqueue acknowledgment alone
-does not guarantee fresh-session recall. Unbacked non-explicit claims remain
-reviewable by default; confidence-only promotion stays disabled. Duplicate suspects,
-dependencies, corrections and revalidation still follow the kernel's review rules.
-Use `lemn pending`, `lemn confirm`, `lemn reject --reason`, and `lemn revalidate`
-as documented in [Operations](docs/operations.md).
-
-Retrieval backend/database failures return HTTP **503**, distinct from a successful
-empty match list. Pi shows that memory retrieval is unavailable and continues
-generation without injected memories. The service currently allows two seconds for
-retrieval and Pi five seconds for the read. Backend response status and empty or
-non-finite embedding vectors are validated; a healthy HTTP listener alone does not
-prove usable embedding inference.
-
-## Resource scheduling
-
-Compose sends daemon extraction, dependency resolution and relation classification
-through the router's authenticated `/internal/extraction` endpoint. The router
-admits one model call at a time across that endpoint and foreground chat; the slot
-is held through the entire response stream. Foreground calls wait with cancellation
-support. Background calls defer with HTTP 503 when busy or foreground work is waiting.
-Running work is not preempted, so foreground requests can still wait for an already
-running extraction.
-
-Multiple queue workers may remain enabled: they no longer imply simultaneous routed
-model inference. HTTP 429/502/503/504/507 and network/deadline failures enter durable
-`RETRY` with 30-60 seconds of jitter without consuming content-error attempts.
-Other processing errors retain bounded retries. Persistent foreground traffic can
-starve background work, and old `FAILED` jobs are not automatically replayed.
-
-This admission control is **single-router and single-slot**, not distributed or
-adaptive memory accounting. Direct oMLX calls, other router instances, and providers
-that bypass LEMN remain outside it. No deadlock was established in the observed
-incident: logs showed memory-pressure eviction, resource rejection and long waits.
-Do not raise memory ceilings or extend timeouts blindly to hide those failures.
-
-See [Resource Scheduling](docs/resource-scheduling.md) for configuration, limits,
-staged deployment and recovery procedures.
-
-## Embedding scheduling
-
-LEMN uses the existing native oMLX BGE-M3 embedding model. Foreground query
-embeddings and background extraction embeddings pass through the same router
-admission gate as chat generation. Foreground retrieval waits for the model slot;
-background work defers when foreground work is active or queued. This coordinates
-inference without loading a duplicate model or changing the stored vector space.
-It does not make MLX CPU-only or add memory headroom: oMLX and all LEMN requests
-still share system resources.
-
-The current model is `bge-m3-mlx-fp16` (1024 dimensions, native XLM-RoBERTa with
-BGE-M3 CLS pooling and normalization). Keep that model and pooling configuration
-compatible with existing stored vectors. A different model requires measured
-retrieval parity and, if incompatible, an explicit re-embedding migration. Do not
-switch vector spaces based only on matching dimensions.
-
-Daemon-to-router embedding calls authenticate with `LEMN_SHARED_SECRET`; the
-router-to-oMLX request uses `LEMN_BACKEND_API_KEY`. Configure both credentials
-for their respective services and restart affected services after rotating either
-key.
-
-The earlier TEI CPU-container experiment could not download the BGE-M3 ONNX
-artifacts (repeated Hugging Face 404s) and has been removed. It was never activated.
-The existing native endpoint returned HTTP 200, and live LEMN retrieval completed
-in 0.72 seconds. That query returned unrelated global preference candidates below
-threshold, however; fresh-session recall of a DPM fact is still unverified.
-
-## Subagents and memory
-
-With the [child-extension setup](docs/operations.md#subagent-memory), Pi
-subagents automatically retrieve relevant LEMN project and global memories,
-but do not submit their runs as new memory candidates. **Read-only refers to
-LEMN memory access, not project files:** children can still discover facts,
-edit code, and run tests according to their assigned tools and permissions.
-
-Children should return established facts separately from hypotheses, along
-with changed files, validation commands/results, and evidence references. The
-parent reviews and integrates those findings; its normal LEMN extension logs
-the completed parent turn. LEMN then decides what to retain and whether review
-is required. This does not automatically approve a child's findings.
-
-Child tool evidence is not automatically copied into the parent's memory log.
-The parent should inspect relevant diffs or test results itself; a summarized
-child report alone may produce an unbacked candidate that needs human review.
-This avoids overlapping or speculative child reports becoming durable memory.
-Child-only defaults can be overridden by agent-specific extension settings;
-see the setup guide and reload Pi after configuration changes.
-
-## Prototype limits and network use
-
-“Local-first” does not mean no network traffic. On first startup, LEMN downloads
-the Laya checkpoint. Model and embedding requests go to the configured
-endpoints, which may be remote. Source-backed revalidation fetches allowlisted
-HTTPS URLs. Docker Compose publishes service ports on host interfaces by
-default. Operational endpoints require the shared secret, but health checks do
-not. See [Operations](docs/operations.md#ports-and-exposure) to restrict access.
-
-The current benchmarks do not establish superiority over a maintained
-`AGENTS.md` or a no-memory workflow. See [Evaluation](docs/evaluation.md) for
-methods, results, and limitations.
-
 ## Quick start
 
 You need Docker Compose and an OpenAI-compatible model server that the
 containers can reach. Pi is needed only for the agent integration. The
 embedding model must match the vector size in `schema.sql` (currently 1024).
-Check that your fast model emits tool calls reliably. If it only describes a
-tool call, the agent may appear to hang.
+Your fast model must emit tool calls reliably; if it only describes them, the
+agent may appear to hang (see the [tool-call check](docs/operations.md#model-tool-call-check)).
 
 ```bash
 cp .env.example .env
@@ -175,25 +47,70 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Wait for all services to become healthy. Laya downloads its checkpoint the
-first time it starts. Follow [the setup guide](docs/operations.md#docker-setup)
-to configure Pi, verify requests, and review memories. Pi runs on the host and
-does not read `.env` automatically. Set its shared secret in Pi's environment.
+Wait for all services to become healthy; Laya downloads its checkpoint on first
+start. Pi runs on the host and does not read `.env`, so set its shared secret in
+Pi's environment. Then follow [the setup guide](docs/operations.md#docker-setup)
+to configure Pi, verify requests, and review memories.
 
-To stop while retaining data, run `docker compose stop`. To remove containers
-and volumes, run `docker compose down -v`; this deletes stored memories and the
-queue.
-
-For updates that replace the router, finish or pause active Pi requests first:
+`docker compose stop` keeps data; `docker compose down -v` deletes stored
+memories and the queue. Recreating the router interrupts its active streams, so
+finish or pause Pi requests before updating:
 
 ```sh
 docker compose up -d --build --no-deps router daemon
 ```
 
-Recreating the router interrupts its active streams. A built image is not evidence
-that the running container has been updated. Verify deployment and live inference
-separately from unit tests. Protected local environment files require user edits;
-never print their credentials in diagnostic output.
+## How it works
+
+### Memory
+
+LEMN adds retrieved memories to Pi's context as a separate message. It does not
+replace or compact Pi's conversation history.
+
+- **Writes are queued.** Pi logs each completed turn; acknowledgment means
+  queued, not saved. `/lemn-job` in Pi reports the last job's outcome.
+- **Not every turn becomes a memory.** Laya gates and an extraction model propose
+  at most one summary per turn. A message starting with `remember` is stored
+  directly as a user-declared fact.
+- **Only authoritative memories are retrieved**, scoped to the current project or
+  `global`. Unbacked claims, duplicates, and corrections go to review with
+  `lemn pending`, `lemn confirm`, `lemn reject --reason`, and `lemn revalidate`.
+- **Outages are visible.** Retrieval failures return HTTP 503; Pi reports them
+  and continues without memories.
+
+Details: [write path](docs/architecture.md#memory-write-path),
+[read path](docs/architecture.md#memory-read-path),
+[review states](docs/architecture.md#review-states), and
+[admin commands](docs/operations.md#admin-commands).
+
+### Model scheduling
+
+The router admits one model call at a time across chat, extraction, and
+embeddings, so background memory work doesn't stack model loads on a shared
+local backend. Foreground requests take priority and cancel running background
+calls. Those jobs return to the durable queue with exponential backoff, without
+using their retry budget. Only traffic through this router is coordinated. See
+[Resource Scheduling](docs/resource-scheduling.md).
+
+### Embeddings
+
+The embedding model (default `bge-m3`) must produce 1024-dimensional vectors.
+Changing it after memories are stored requires a retrieval parity check and
+possibly re-embedding; see
+[Native Embeddings](docs/resource-scheduling.md#native-embeddings).
+
+## Prototype limits and network use
+
+“Local-first” does not mean no network traffic. On first startup, LEMN downloads
+the Laya checkpoint. Model and embedding requests go to the configured
+endpoints, which may be remote. Source-backed revalidation fetches allowlisted
+HTTPS URLs. Docker Compose publishes service ports on host interfaces by
+default. Operational endpoints require the shared secret, but health checks do
+not. See [Operations](docs/operations.md#ports-and-exposure) to restrict access.
+
+The current benchmarks do not establish superiority over a maintained
+`AGENTS.md` or a no-memory workflow. See [Evaluation](docs/evaluation.md) for
+methods, results, and limitations.
 
 ## Development and agent guidance
 
@@ -221,7 +138,7 @@ backend availability or cross-session recall.
 ## Guides
 
 - [Architecture](docs/architecture.md): routing, memory storage and retrieval, lifecycle, scope, and network use.
-- [Operations](docs/operations.md): setup, Pi integration, administration, configuration, and troubleshooting.
+- [Operations](docs/operations.md): setup, Pi integration, optional subagent memory, administration, configuration, and troubleshooting.
 - [Evaluation](docs/evaluation.md): threshold tuning, benchmark steps, results, and limitations.
 - [Resource Scheduling](docs/resource-scheduling.md): priority admission, retries, and embedding isolation.
 
